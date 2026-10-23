@@ -486,7 +486,7 @@ func cmdClaude(ctx context.Context, m *workspace.Manager, args []string, env Env
 // folders to enable. skerry is opt-in: with no answer, nothing changes for
 // Claude Code worktrees until the user runs skerry enable.
 func enableAfterInstall(m *workspace.Manager, dirs []string, yes bool, env Env) error {
-	if len(dirs) == 0 && env.Interactive {
+	if len(dirs) == 0 && env.Interactive && !yes {
 		fmt.Fprint(env.Stderr, "\nskerry only takes over checkouts in folders you enable; elsewhere worktrees\n"+
 			"stay plain git worktrees, as before. Which folders should use skerry?\n"+
 			"Enter paths separated by commas, or leave empty to decide later: ")

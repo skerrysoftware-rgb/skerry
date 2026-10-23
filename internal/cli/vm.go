@@ -171,7 +171,8 @@ func runInWorkspace(ctx context.Context, ws registry.Workspace, args []string, e
 		Args: args, Dir: dir, Env: vars,
 		Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr, Signals: sigs,
 	})
-	reportPlanted(ctx, ws, env)
+	// Scan however the command ended, even if it was interrupted.
+	reportPlanted(context.WithoutCancel(ctx), ws, env)
 	if err != nil {
 		return err
 	}

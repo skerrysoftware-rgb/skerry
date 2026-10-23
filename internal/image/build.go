@@ -110,6 +110,7 @@ func (b *Builder) Build(ctx context.Context, spec Spec) (Image, error) {
 	img := b.layout(id)
 	if m, err := readManifest(img.Dir); err == nil && m.Format == formatVersion {
 		img.Finalized = m.Finalized
+		touch(img.Dir)
 		return img, nil
 	}
 

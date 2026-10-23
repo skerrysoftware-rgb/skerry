@@ -472,6 +472,12 @@ func (n *Network) answer(query []byte) ([]byte, error) {
 	// Too big for one datagram: send as many answers as fit. (Marking it
 	// truncated would send the resolver to TCP, which the gateway doesn't
 	// serve.)
+	if err == nil && len(out) > maxDNSResponse {
+		// Cut in proportion first, so a huge answer costs a few packs.
+		keep := len(resp.Answers) * maxDNSResponse / len(out)
+		resp.Answers = resp.Answers[:keep]
+		out, err = resp.Pack()
+	}
 	for err == nil && len(out) > maxDNSResponse && len(resp.Answers) > 0 {
 		resp.Answers = resp.Answers[:len(resp.Answers)-1]
 		out, err = resp.Pack()

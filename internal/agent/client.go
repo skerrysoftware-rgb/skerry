@@ -56,8 +56,12 @@ func (c *Client) bounded(what string, f func() error) error {
 		return err
 	case <-t.C:
 		c.conn.Close()
-		return fmt.Errorf("the agent did not answer %s within %s", what, requestTimeout)
+		return timeoutError(what)
 	}
+}
+
+func timeoutError(what string) error {
+	return fmt.Errorf("the agent did not answer %s within %s", what, requestTimeout)
 }
 
 // Ping checks that the agent is answering.
@@ -73,12 +77,33 @@ func (c *Client) Ping() error {
 
 // DialGuest connects to a TCP port on the guest's loopback interface.
 func (c *Client) DialGuest(port uint16) (net.Conn, error) {
-	var conn net.Conn
-	err := c.bounded("a connection request", func() (err error) {
-		conn, err = c.conn.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
-		return err
-	})
-	return conn, err
+	// Unlike other requests, a slow one doesn't close the connection: it
+	// carries other forwarded connections, which shouldn't end with it.
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+	abandoned := make(chan struct{})
+	go func() {
+		conn, err := c.conn.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
+		select {
+		case done <- result{conn, err}:
+		case <-abandoned:
+			if conn != nil {
+				conn.Close() // answered too late
+			}
+		}
+	}()
+	t := time.NewTimer(requestTimeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.conn, r.err
+	case <-t.C:
+		close(abandoned)
+		return nil, &ssh.OpenChannelError{Reason: ssh.ConnectionFailed, Message: timeoutError("a connection request").Error()}
+	}
 }
 
 // Poweroff asks the guest to shut down cleanly.

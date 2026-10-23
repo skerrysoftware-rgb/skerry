@@ -53,7 +53,15 @@ func (b *Builder) Pinned(spec Spec, maxAge time.Duration) (Image, bool) {
 		return Image{}, false
 	}
 	img.Finalized = m.Finalized
+	touch(img.Dir)
 	return img, true
+}
+
+// touch marks an image as just used, so skerry gc (which spares images
+// changed in the last hour) can't delete it while a workspace starts on it.
+func touch(dir string) {
+	now := time.Now()
+	_ = os.Chtimes(dir, now, now)
 }
 
 // Pin records img, just built or checked against the newest packages, as
@@ -64,6 +72,7 @@ func (b *Builder) Pin(spec Spec, img Image) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	touch(img.Dir)
 	data, err := json.Marshal(pin{ID: img.ID, Built: time.Now().UTC()})
 	if err != nil {
 		return err

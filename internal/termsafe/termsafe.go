@@ -39,8 +39,9 @@ func needsCleaning(s string) bool {
 	return false
 }
 
-// unsafe reports C0 and C1 controls (ESC, BEL, CSI...) and DEL, except
-// newline, carriage return and tab.
+// unsafe reports C0 and C1 controls (ESC, BEL, CSI...), DEL and the
+// bidirectional controls, except newline and tab. (Clean lets a carriage
+// return through only as part of CRLF.)
 func unsafe(r rune) bool {
 	switch r {
 	case '\n', '\t':
@@ -68,6 +69,10 @@ func (w *Writer) Write(p []byte) (int, error) {
 			}
 			break
 		}
+	}
+	// Likewise a CR that may be the first half of a CRLF.
+	if cut > 0 && cut == len(data) && data[cut-1] == '\r' {
+		cut--
 	}
 	w.partial = append([]byte(nil), data[cut:]...)
 	if _, err := io.WriteString(w.W, Clean(string(data[:cut]))); err != nil {

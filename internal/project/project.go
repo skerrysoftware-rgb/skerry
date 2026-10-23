@@ -287,12 +287,21 @@ func fromPyproject(text string) []string {
 		for _, m := range pythonQuoted.FindAllStringSubmatch(value, -1) {
 			names = append(names, normalizePython(m[1]))
 		}
-		if strings.Contains(value, "]") {
+		// The list ends at a ] outside quotes and comments: extras such
+		// as "psycopg[binary]" don't end it.
+		bare := pythonString.ReplaceAllString(value, `""`)
+		if i := strings.Index(bare, "#"); i >= 0 {
+			bare = bare[:i]
+		}
+		if strings.Contains(bare, "]") {
 			inArray = false
 		}
 	}
 	return matchNames(names, pythonPackages, equal)
 }
+
+// pythonString matches a quoted TOML string.
+var pythonString = regexp.MustCompile(`"[^"]*"|'[^']*'`)
 
 // pythonQuoted finds the package name at the start of a quoted requirement.
 var pythonQuoted = regexp.MustCompile(`["']\s*([A-Za-z0-9][A-Za-z0-9._-]*)`)

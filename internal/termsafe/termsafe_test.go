@@ -23,13 +23,13 @@ func TestClean(t *testing.T) {
 func TestWriterKeepsSplitRunes(t *testing.T) {
 	var out strings.Builder
 	w := &Writer{W: &out}
-	s := "✓ done\x1b[0m"
+	s := "✓ done\r\nok\x1b[0m"
 	for i := 0; i < len(s); i++ {
 		if _, err := w.Write([]byte{s[i]}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := out.String(); got != "✓ done?[0m" {
+	if got := out.String(); got != "✓ done\nok?[0m" {
 		t.Errorf("got %q", got)
 	}
 }

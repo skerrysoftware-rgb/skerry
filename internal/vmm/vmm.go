@@ -27,6 +27,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -458,12 +460,21 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	}
 	l.Close()
 	// Ask the guest to shut down cleanly, talking to it directly; force it
-	// off if it doesn't (a hostile guest may ignore the request).
-	if conn, err := vm.Dial(agent.Port); err == nil {
-		if c, err := agent.NewClient(conn, keys); err == nil {
-			_ = c.Poweroff()
-			c.Close()
+	// off if it doesn't (a hostile guest may ignore the request, or stall
+	// the connection, so asking gets a few seconds at most).
+	asked := make(chan struct{})
+	go func() {
+		defer close(asked)
+		if conn, err := vm.Dial(agent.Port); err == nil {
+			if c, err := agent.NewClient(conn, keys); err == nil {
+				_ = c.Poweroff()
+				c.Close()
+			}
 		}
+	}()
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
 	}
 	select {
 	case <-vm.Done():
@@ -560,19 +571,27 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 }
 
 // limitedBuffer keeps the first max bytes written to it and drops the rest.
+// It is safe for concurrent writers (a command's stdout and stderr).
 type limitedBuffer struct {
 	max int
+	mu  sync.Mutex
 	b   strings.Builder
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if room := l.max - l.b.Len(); room > 0 {
 		l.b.Write(p[:min(len(p), room)])
 	}
 	return len(p), nil
 }
 
-func (l *limitedBuffer) String() string { return l.b.String() }
+func (l *limitedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
 
 // waitServices blocks until the guest reports every service ready. It
 // costs one round trip when they already are.
@@ -612,6 +631,7 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 	}
 
 	var runner *exec.Cmd
+	var runnerDone atomic.Bool // set once Wait has returned
 	exited := make(chan error, 1)
 	if !m.Running(ws) {
 		// Build the image here, so progress and errors are visible.
@@ -626,11 +646,15 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		if runner, err = m.spawnRunner(ws, p); err != nil {
 			return nil, err
 		}
-		go func() { exited <- runner.Wait() }()
+		go func() {
+			err := runner.Wait()
+			runnerDone.Store(true)
+			exited <- err
+		}()
 	}
 	// stop ends the runner this call started, if starting failed.
 	stop := func() {
-		if runner != nil && runner.ProcessState == nil {
+		if runner != nil && !runnerDone.Load() {
 			_ = syscall.Kill(-runner.Process.Pid, syscall.SIGTERM)
 		}
 	}

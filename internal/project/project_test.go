@@ -92,7 +92,7 @@ func TestDetectEachEcosystem(t *testing.T) {
 	cases := map[string][2]string{
 		"go.mod":           {"module x\n\nrequire github.com/jackc/pgx/v5 v5.7.0\n\nrequire (\n\tgo.temporal.io/sdk v1.30.0\n)\n", "postgres temporal"},
 		"requirements.txt": {"redis[hiredis]>=5\nPsycopg2-Binary==2.9\n", "postgres valkey"},
-		"pyproject.toml":   {"[project]\nname = \"x\"\ndependencies = [\n  \"temporalio>=1.7\",\n  \"asyncpg\",\n]\n\n[tool.poetry.group.dev.dependencies]\nredis = \"^5\"\n", "postgres temporal valkey"},
+		"pyproject.toml":   {"[project]\nname = \"x\"\ndependencies = [\n  \"fastapi[standard]\",  # see [docs]\n  \"temporalio>=1.7\",\n  \"asyncpg\",\n]\n\n[tool.poetry.group.dev.dependencies]\nredis = \"^5\"\n", "postgres temporal valkey"},
 		"Gemfile":          {"source 'https://rubygems.org'\ngem 'pg', '~> 1.5'\ngem \"redis\"\n", "postgres valkey"},
 		"compose.yaml":     {"services:\n  db:\n    image: postgres:17\n  cache:\n    image: docker.io/valkey/valkey:8\n  t:\n    image: temporalio/auto-setup:1.25\n", "postgres temporal valkey"},
 	}

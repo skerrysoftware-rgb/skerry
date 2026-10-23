@@ -26,7 +26,11 @@ func OpenCappedLog(path string, max int64) (*CappedLog, error) {
 	return &CappedLog{path: path, max: max, f: f}, nil
 }
 
+// Write always reports all of p written, even when it kept only the end of
+// an oversized write: writers such as io.MultiWriter treat a short count
+// as an error.
 func (l *CappedLog) Write(p []byte) (int, error) {
+	whole := len(p)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.size+int64(len(p)) > l.max {
@@ -43,7 +47,10 @@ func (l *CappedLog) Write(p []byte) (int, error) {
 	}
 	n, err := l.f.Write(p)
 	l.size += int64(n)
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	return whole, nil
 }
 
 // Close closes the current file.

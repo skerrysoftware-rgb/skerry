@@ -24,6 +24,10 @@ import (
 const (
 	RequestPing     = "ping@skerry"
 	RequestPoweroff = "poweroff@skerry"
+	// RequestTouch carries paths (relative to the workspace, separated by
+	// NUL) the host saw change, so the agent can raise file events for
+	// them in the guest.
+	RequestTouch = "touch@skerry"
 )
 
 // EnvCwd carries the working directory for a command.
@@ -34,6 +38,7 @@ const (
 	maxEnvVars  = 128
 	maxEnvValue = 32 << 10
 	maxCommand  = 256 << 10
+	maxTouch    = 1 << 20
 )
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
@@ -55,7 +60,11 @@ type Server struct {
 	// Env is added to every command's environment; the client's variables
 	// win over it, and baseEnv wins over both.
 	Env map[string]string
-	Log *log.Logger
+	// Workspace is the checkout's path, for touch requests; empty refuses
+	// them.
+	Workspace string
+	touches   touchQueue
+	Log       *log.Logger
 }
 
 // NewServer builds a server that accepts only authorizedKey.
@@ -174,6 +183,13 @@ func (s *Server) globalRequests(reqs <-chan *ssh.Request) {
 		switch req.Type {
 		case RequestPing:
 			_ = req.Reply(true, nil)
+		case RequestTouch:
+			if s.Workspace == "" || len(req.Payload) > maxTouch {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			_ = req.Reply(true, nil)
+			s.touches.add(s.Workspace, strings.Split(string(req.Payload), "\x00"))
 		case RequestPoweroff:
 			if s.Poweroff == nil {
 				_ = req.Reply(false, nil)
@@ -340,4 +356,55 @@ func exitStatus(cmd *exec.Cmd, err error) uint32 {
 		return 255
 	}
 	return 0
+}
+
+// maxPendingTouches bounds paths waiting to be touched; more are dropped.
+const maxPendingTouches = 50000
+
+// touchQueue hands touch requests to a worker, so a backlog of them (a
+// large checkout on the host) never holds up the connection's other
+// traffic: global requests share it with port forwards.
+type touchQueue struct {
+	mu        sync.Mutex
+	pending   map[string]bool
+	workspace string
+	wake      chan struct{}
+	start     sync.Once
+}
+
+func (q *touchQueue) add(workspace string, paths []string) {
+	q.mu.Lock()
+	q.workspace = workspace
+	if q.pending == nil {
+		q.pending = map[string]bool{}
+	}
+	for _, p := range paths {
+		if len(q.pending) >= maxPendingTouches {
+			break
+		}
+		q.pending[p] = true
+	}
+	q.mu.Unlock()
+	q.start.Do(func() {
+		q.wake = make(chan struct{}, 1)
+		go q.work()
+	})
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *touchQueue) work() {
+	for range q.wake {
+		q.mu.Lock()
+		batch := make([]string, 0, len(q.pending))
+		for p := range q.pending {
+			batch = append(batch, p)
+		}
+		clear(q.pending)
+		ws := q.workspace
+		q.mu.Unlock()
+		touchAll(ws, batch)
+	}
 }

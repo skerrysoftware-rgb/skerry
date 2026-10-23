@@ -1,0 +1,13 @@
+{
+  "name": "skerry",
+  "owner": { "name": "skerry", "url": "https://github.com/skerrysoftware-rgb" },
+  "description": "An isolated, lightweight Linux VM for every Claude Code worktree",
+  "plugins": [
+    {
+      "name": "skerry",
+      "source": "./plugin",
+      "description": "Gives every Claude Code worktree in an enabled folder its own VM, with its own services and data",
+      "category": "devtools"
+    }
+  ]
+}

@@ -339,6 +339,7 @@ func Serve() error {
 	srv := NewServer(hostKey, clientKey)
 	srv.Log = logger
 	srv.Env = services.Env(cfg.Services, cfg.Secret)
+	srv.Workspace = cfg.WorkspacePath
 	// PID 1 stops the services cleanly before powering off.
 	srv.Poweroff = func() { _ = unix.Kill(1, unix.SIGTERM) }
 	l, err := listenVsock(Port)

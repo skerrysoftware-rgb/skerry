@@ -1,0 +1,27 @@
+#!/bin/sh
+# Runs `skerry hook EVENT`. Claude Code passes the event's JSON on stdin,
+# which skerry reads.
+#
+# Hooks run in the project, which code in a workspace VM can write to, so
+# skerry is looked for in the usual install locations first, and on PATH
+# only as an absolute path outside the current directory: never a
+# ./skerry or node_modules/.bin/skerry the project could have planted.
+for skerry in "$HOME/.local/bin/skerry" /opt/homebrew/bin/skerry /usr/local/bin/skerry "$(command -v skerry 2>/dev/null)"; do
+	case $skerry in
+	"$PWD"/* | "") continue ;;
+	/*) ;;
+	*) continue ;;
+	esac
+	if [ -f "$skerry" ] && [ -x "$skerry" ]; then
+		exec "$skerry" hook "$1"
+	fi
+done
+case "$1" in
+session-start)
+	exit 0 # nothing to add
+	;;
+*)
+	echo "the skerry plugin is enabled, but the skerry command isn't installed (see https://github.com/skerrysoftware-rgb/skerry); disable the plugin or install skerry" >&2
+	exit 1
+	;;
+esac

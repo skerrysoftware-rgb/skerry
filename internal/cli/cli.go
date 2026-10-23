@@ -59,8 +59,14 @@ Usage:
   skerry status [name]                show its services and forwarded ports
   skerry url [-w name] SERVICE        print a URL for a service, for tools on this Mac
   skerry logs [-w name] [-f] [-n N] SERVICE|console|network
-  skerry reset [name] [--yes]         delete the workspace's service data
+  skerry reset [name] [--snapshot S | --empty] [--yes]
+                                      replace the workspace's service data
+  skerry setup [name]                 run the project's seed and setup commands again
+  skerry seed [-w name] FILE          load a .sql, .sql.gz or .dump file into its Postgres
+  skerry snapshot save [NAME] | ls | rm NAME [-w name]
+                                      save its service data for new workspaces (default)
   skerry gc                           delete images and downloads no workspace needs
+  skerry statusline                   one line for Claude Code's status line
   skerry exec [-w name] -- CMD...     run a command inside the workspace VM
   skerry enable [DIR] [--yes]         use skerry for checkouts under DIR
   skerry disable [DIR]                stop using skerry under DIR
@@ -139,6 +145,14 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdReset(ctx, m, rest, env)
 	case "gc":
 		return cmdGC(m, rest, env)
+	case "snapshot":
+		return cmdSnapshot(ctx, m, rest, env)
+	case "setup":
+		return cmdSetup(ctx, m, rest, env)
+	case "seed":
+		return cmdSeed(ctx, m, rest, env)
+	case "statusline":
+		return cmdStatusline(m, env)
 	case "vm":
 		return cmdVM(ctx, m, rest, env)
 	case "claude":

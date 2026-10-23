@@ -1,0 +1,10 @@
+{
+  "name": "skerry",
+  "version": "0.1.0",
+  "description": "Gives every Claude Code worktree in an enabled folder its own lightweight Linux VM, with its own Postgres, Valkey and Temporal. Needs the skerry command installed.",
+  "author": { "name": "Mohan S" },
+  "homepage": "https://github.com/skerrysoftware-rgb/skerry",
+  "repository": "https://github.com/skerrysoftware-rgb/skerry",
+  "license": "MIT",
+  "keywords": ["worktree", "vm", "isolation", "sandbox", "postgres", "temporal"]
+}

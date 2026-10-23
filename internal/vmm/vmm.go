@@ -96,7 +96,8 @@ func (m *Manager) progressf(format string, args ...any) {
 // Workspace paths.
 type wsPaths struct {
 	state, share, socket, lock, console, runnerLog, pid, machineID string
-	dataDisk, secret, status, networkLog, image                    string
+	dataDisk, secret, status, networkLog, image, setup, setupLog   string
+	stopping                                                       string
 }
 
 func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
@@ -119,6 +120,9 @@ func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
 		status:     filepath.Join(state, "status.json"),
 		networkLog: filepath.Join(state, "network.log"),
 		image:      filepath.Join(state, "image"),
+		setup:      filepath.Join(state, "setup.json"),
+		setupLog:   filepath.Join(state, "setup.log"),
+		stopping:   filepath.Join(state, "stopping"),
 	}, nil
 }
 
@@ -369,8 +373,12 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 		if cfg.Secret, err = secret(p.secret); err != nil {
 			return err
 		}
-		if err := ensureDisk(p.dataDisk, dataDiskSize); err != nil {
+		created, err := m.ensureDisk(ws, p, dataDiskSize)
+		if err != nil {
 			return err
+		}
+		if created {
+			_ = os.Remove(p.setup) // new data: seed and set up again
 		}
 		cfg.Services, cfg.DataDisk, dataDisk = proj.Services, true, p.dataDisk
 	}
@@ -403,9 +411,10 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	defer stopNet()
 	network.Attach(netCtx, hostNet)
 
+	cpus, memMiB := resources()
 	vm, err := engine.Start(engine.Config{
 		Kernel: img.Kernel, Initramfs: img.Initramfs, Rootfs: img.Rootfs,
-		ConfigDir: p.share, WorkDir: ws.Path, CPUs: CPUs, MemoryMiB: MemoryMiB,
+		ConfigDir: p.share, WorkDir: ws.Path, CPUs: cpus, MemoryMiB: memMiB,
 		MachineIDFile: p.machineID, Console: console,
 		Network: vmNet, MAC: macFor(ws.ID), DataDisk: dataDisk,
 	})
@@ -413,10 +422,16 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 		vmNet.Close()
 		return err
 	}
-	dialer := &guestDialer{vm: vm, keys: keys, open: map[net.Conn]bool{}}
+	act := newActivity()
+	dialer := &guestDialer{vm: vm, keys: keys, open: map[net.Conn]bool{}, act: act}
 	defer dialer.close()
 	forwards, closeForwards := m.forward(dialer, p, proj)
 	defer closeForwards()
+	if w, err := forwardFileEvents(ws, dialer); err != nil {
+		fmt.Fprintf(os.Stderr, "file events: %v\n", err)
+	} else if w != nil {
+		defer w.Close()
+	}
 	if err := writeStatus(p.status, Status{Hostname: hostname(ws.Name), Services: proj.Services, Source: proj.Source, Forwards: forwards}); err != nil {
 		fmt.Fprintf(os.Stderr, "write status: %v\n", err)
 	}
@@ -443,7 +458,10 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 			if err != nil {
 				return
 			}
-			go proxy(conn, vm)
+			go func() {
+				defer act.begin()()
+				proxy(conn, vm)
+			}()
 		}
 	}()
 	// Code in the VM keeps running between commands (dev servers, watchers),
@@ -452,11 +470,16 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	defer stopScan()
 	go watchCheckout(scanCtx, ws)
 
+	idle := idleStop()
+	stopIdle := make(chan struct{})
+	defer close(stopIdle)
 	select {
 	case <-vm.Done():
 		l.Close()
 		return vm.Err()
 	case <-ctx.Done():
+	case <-act.whenIdle(idle, stopIdle):
+		fmt.Fprintf(os.Stderr, "stopping: idle for %s\n", idle)
 	}
 	l.Close()
 	// Ask the guest to shut down cleanly, talking to it directly; force it
@@ -567,6 +590,17 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 		}
 		m.progressf("WARNING: %s", termsafe.Clean(err.Error()))
 	}
+	proj, err := project.Load(ws.Path)
+	if err == nil {
+		err = m.ensureSetup(ctx, c, ws, proj)
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			c.Close()
+			return nil, ctx.Err()
+		}
+		m.progressf("WARNING: %s", termsafe.Clean(err.Error()))
+	}
 	return c, nil
 }
 
@@ -630,27 +664,40 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		return nil, err
 	}
 
-	var runner *exec.Cmd
-	var runnerDone atomic.Bool // set once Wait has returned
-	exited := make(chan error, 1)
-	if !m.Running(ws) {
+	var (
+		runner     *exec.Cmd
+		runnerDone atomic.Bool // set once Wait has returned
+		exited     = make(chan error, 1)
+		starts     int
+	)
+	start := func() error {
 		// Build the image here, so progress and errors are visible.
 		proj, err := project.Load(ws.Path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if _, err := m.Image(ctx, proj); err != nil {
-			return nil, err
+			return err
 		}
 		m.progressf("starting workspace %s", ws.Name)
-		if runner, err = m.spawnRunner(ws, p); err != nil {
-			return nil, err
+		starts++
+		r, err := m.spawnRunner(ws, p)
+		if err != nil {
+			return err
 		}
+		runner = r
+		runnerDone.Store(false)
 		go func() {
-			err := runner.Wait()
+			err := r.Wait()
 			runnerDone.Store(true)
 			exited <- err
 		}()
+		return nil
+	}
+	if !m.Running(ws) {
+		if err := start(); err != nil {
+			return nil, err
+		}
 	}
 	// stop ends the runner this call started, if starting failed.
 	stop := func() {
@@ -670,11 +717,12 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		select {
 		case err := <-exited:
 			runner = nil
-			if !m.Running(ws) {
+			if !m.Running(ws) && starts >= 3 {
 				// No runner holds the workspace: ours failed for real.
 				return nil, fmt.Errorf("workspace VM exited (%v); see %s and %s", err, p.runnerLog, p.console)
 			}
-			// Another runner won the race; keep waiting for it.
+			// Another runner won the race, or one was stopping (an idle
+			// stop) when ours started; keep waiting, or start again below.
 		case <-deadline:
 			stop()
 			return nil, fmt.Errorf("workspace VM did not answer within %s; see %s", bootTimeout, p.console)
@@ -682,6 +730,14 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 			stop()
 			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
+		}
+		// The workspace was running when we looked but has stopped since
+		// (an idle stop, skerry down): start it again.
+		if runner == nil && !m.Running(ws) && starts < 3 {
+			if err := start(); err != nil {
+				return nil, err
+			}
+			deadline = time.After(bootTimeout) // the new runner gets its own time
 		}
 	}
 }
@@ -717,6 +773,11 @@ func (m *Manager) Down(ws registry.Workspace) error {
 	if !m.Running(ws) {
 		return nil
 	}
+	// Setup running now will fail as the guest's services stop; this marks
+	// that as an interruption, not the project's failure.
+	_ = os.WriteFile(p.stopping, nil, 0o600)
+	now := time.Now()
+	_ = os.Chtimes(p.stopping, now, now)
 	if c, err := m.Connect(ws); err == nil {
 		_ = c.Poweroff()
 		c.Close()
@@ -768,9 +829,11 @@ func (m *Manager) runnerPID(p wsPaths, ws registry.Workspace) (int, error) {
 	return pid, nil
 }
 
-// ResetData deletes a stopped workspace's data disk; the next start makes
-// a blank one.
-func (m *Manager) ResetData(ws registry.Workspace) error {
+// ResetData replaces a stopped workspace's service data: with a clone of
+// snapshot if one is named; otherwise, with useDefault, with what a new
+// workspace gets (the repository's default snapshot, or nothing); or else
+// with an empty disk.
+func (m *Manager) ResetData(ws registry.Workspace, snapshot string, useDefault bool) error {
 	if m.Running(ws) {
 		return fmt.Errorf("workspace %s is still running", ws.Name)
 	}
@@ -788,7 +851,34 @@ func (m *Manager) ResetData(ws registry.Workspace) error {
 		return fmt.Errorf("workspace %s started again; stop it and retry", ws.Name)
 	}
 	defer unlock()
-	if err := os.Remove(p.dataDisk); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if snapshot != "" {
+		// Clone first, so a wrong name loses nothing.
+		tmp := p.dataDisk + ".new"
+		_ = os.Remove(tmp)
+		if _, err := m.cloneSnapshot(ws, snapshot, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, p.dataDisk); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		return removeIfExists(p.setup)
+	}
+	if err := removeIfExists(p.dataDisk); err != nil {
+		return err
+	}
+	if err := removeIfExists(p.setup); err != nil {
+		return err
+	}
+	if !useDefault {
+		// An empty disk, so the default snapshot isn't cloned at start.
+		return ensureSparse(p.dataDisk, dataDiskSize)
+	}
+	return nil
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -953,8 +1043,27 @@ func secret(path string) (string, error) {
 	return s, fsutil.WriteFileAtomic(path, []byte(s+"\n"), 0o600)
 }
 
-// ensureDisk creates a sparse disk image of size bytes if none exists.
-func ensureDisk(path string, size int64) error {
+// ensureDisk makes the workspace's data disk if it has none: a clone of the
+// repository's default snapshot if there is one, else a blank sparse
+// file. It reports whether it made one.
+func (m *Manager) ensureDisk(ws registry.Workspace, p wsPaths, size int64) (bool, error) {
+	if info, err := os.Lstat(p.dataDisk); err == nil {
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("%s is not a regular file", p.dataDisk)
+		}
+		return false, nil
+	}
+	if ok, err := m.cloneSnapshot(ws, DefaultSnapshot, p.dataDisk); ok || err != nil {
+		if ok {
+			fmt.Fprintf(os.Stderr, "data disk: a clone of snapshot %s\n", DefaultSnapshot)
+		}
+		return ok, err
+	}
+	return true, ensureSparse(p.dataDisk, size)
+}
+
+// ensureSparse creates a sparse disk image of size bytes if none exists.
+func ensureSparse(path string, size int64) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		info, err := os.Lstat(path)

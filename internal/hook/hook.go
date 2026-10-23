@@ -209,7 +209,7 @@ func servicesContext(ws registry.Workspace) string {
 		return fmt.Sprintf(" This project's %s is invalid, so the workspace runs no services; `skerry status` shows why.", project.FileName)
 	}
 	if len(proj.Services) == 0 {
-		return ""
+		return setupContext(proj)
 	}
 	var vars []string
 	for k := range services.Env(proj.Services, "x") {
@@ -221,7 +221,17 @@ func servicesContext(ws registry.Workspace) string {
 		" They are set in the environment, so they win over the same names in a .env file (dotenv loaders don't override existing variables)."+
 		" Tools such as psql, valkey-cli and temporal are available through `skerry exec -- <tool>`."+
 		" `skerry status` lists the services and the ports they are forwarded to on this machine.",
-		strings.Join(proj.Services, ", "), proj.Source, strings.Join(vars, ", "))
+		strings.Join(proj.Services, ", "), proj.Source, strings.Join(vars, ", ")) + setupContext(proj)
+}
+
+// setupContext explains the project's setup commands, if it has any.
+func setupContext(proj project.Project) string {
+	if len(proj.Setup) == 0 && proj.SeedPostgres == "" {
+		return ""
+	}
+	return " When the workspace's data is new, skerry seeds it and runs the project's setup commands from skerry.yaml" +
+		" (such as installing dependencies and migrations) before the first command; `skerry logs setup` shows their output," +
+		" and `skerry setup` runs them again, for example after new migrations."
 }
 
 // appendLines adds lines to Claude's env file, which it sources before every

@@ -1,0 +1,14 @@
+{
+  "description": "Creates, removes and introduces skerry workspaces for Claude Code worktrees",
+  "hooks": {
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/skerry-hook worktree-create" }] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/skerry-hook worktree-remove" }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/skerry-hook session-start" }] }
+    ]
+  }
+}

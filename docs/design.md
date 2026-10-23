@@ -594,8 +594,8 @@ Findings from the review before building, and what changed.
 | M3 Network ✅ | Per-workspace stack, egress policy, loopback forwards (`*.localhost` proxy later) | Policy tests pass; probes from a real VM refused for the host, LAN, gateway and metadata; Postgres reachable from host tools |
 | M4 Services ✅ | Presets (Postgres 17 + pgvector, Valkey, Temporal), data disk, supervisor, readiness (lazy start later) | Two workspaces on two branches run their own migrations and Temporal workflows side by side; data survives restarts |
 | M5 Detection | Detectors, plan cache, `skerry.yaml`, profiles, secrets sources | A real-world monorepo gets a correct plan with no config beyond overrides |
-| M6 Seed | Snapshot builder, clone, migrate, drift handling | A workspace has a seeded database with current migrations in seconds after the first snapshot |
-| M7 Experience | Events, `watch`, status line, file-event forwarding, idle stop, memory cap, image cache cleanup, Claude Code plugin packaging | Hot reload works; idle workspaces stop |
+| M6 Seed ✅ | Seed from a dump (in the repository, or from the Mac), setup commands, snapshots cloned per workspace (APFS) | A new workspace starts from the default snapshot and runs its branch's migrations on top |
+| M7 Experience ✅ (mostly) | Status line, file-event forwarding (FSEvents → re-stamp in the guest), idle stop, CPU/memory settings, image pinning and `gc`, Claude Code plugin; `watch` and an events stream later | Hot reload works; idle workspaces stop |
 | M8 Hardening | Escape tests, fuzzing, threat-model tests, docs | All invariants have passing tests |
 
 **Release 2:** Linux (cloud-hypervisor, namespaces), CI on KVM.

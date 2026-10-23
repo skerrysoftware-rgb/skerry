@@ -31,6 +31,35 @@ func TestConfigWins(t *testing.T) {
 	}
 }
 
+func TestSetupAndSeed(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "package.json", `{"dependencies":{"pg":"8"}}`)
+	write(t, dir, FileName, "setup:\n  - npm ci\n  - npm run migrate\nseed:\n  postgres: db/./seed.sql.gz\n")
+	p, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(p.Setup, "|") != "npm ci|npm run migrate" || p.SeedPostgres != "db/seed.sql.gz" {
+		t.Errorf("got setup %q, seed %q", p.Setup, p.SeedPostgres)
+	}
+	if !slices.Equal(p.Services, []string{"postgres"}) {
+		t.Errorf("detection stopped working with a config that names no services: %v", p.Services)
+	}
+	for name, text := range map[string]string{
+		"absolute seed":    "services: [postgres]\nseed: {postgres: /etc/passwd.sql}\n",
+		"escaping seed":    "services: [postgres]\nseed: {postgres: ../secrets.sql}\n",
+		"other extension":  "services: [postgres]\nseed: {postgres: db/seed.sh}\n",
+		"seed without pg":  "services: []\nseed: {postgres: seed.sql}\n",
+		"empty setup step": "setup: ['']\n",
+	} {
+		dir := t.TempDir()
+		write(t, dir, FileName, text)
+		if _, err := Load(dir); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 func TestEmptyServicesTurnsDetectionOff(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "package.json", `{"dependencies":{"pg":"8"}}`)

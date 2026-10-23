@@ -34,6 +34,9 @@ const (
 	maxConfig = 64 << 10
 	maxScan   = 1 << 20
 	maxPorts  = 16
+	// maxSetup and maxSetupCommand bound the setup commands.
+	maxSetup        = 32
+	maxSetupCommand = 4 << 10
 )
 
 // Project is what a workspace runs.
@@ -45,12 +48,26 @@ type Project struct {
 	// Source says where Services came from: FileName, or the files
 	// detection read.
 	Source string
+	// Setup are shell commands run in the VM, in the checkout, when a
+	// workspace's data is new: installing dependencies, migrations.
+	Setup []string
+	// SeedPostgres is a dump in the repository (relative to its root)
+	// loaded into the app database before setup, when the database is
+	// empty: .sql, .sql.gz, or a pg_dump custom-format .dump.
+	SeedPostgres string
 }
 
 type config struct {
 	Services *[]string `yaml:"services"`
 	Ports    []int     `yaml:"ports"`
+	Setup    []string  `yaml:"setup"`
+	Seed     struct {
+		Postgres string `yaml:"postgres"`
+	} `yaml:"seed"`
 }
+
+// seedExtensions are the dump formats skerry loads.
+var seedExtensions = []string{".sql", ".sql.gz", ".dump"}
 
 // Load reads the project at dir.
 func Load(dir string) (Project, error) {
@@ -78,15 +95,36 @@ func Load(dir string) (Project, error) {
 				p.Ports = append(p.Ports, uint16(port))
 			}
 		}
+		if len(c.Setup) > maxSetup {
+			return p, fmt.Errorf("%s: at most %d setup commands", FileName, maxSetup)
+		}
+		for _, cmd := range c.Setup {
+			if strings.TrimSpace(cmd) == "" || len(cmd) > maxSetupCommand || strings.ContainsRune(cmd, 0) {
+				return p, fmt.Errorf("%s: setup commands must be non-empty and under %d bytes", FileName, maxSetupCommand)
+			}
+		}
+		p.Setup = c.Setup
+		if seed := c.Seed.Postgres; seed != "" {
+			// Read in the VM, from the checkout: it must name a file in it.
+			if !filepath.IsLocal(seed) || strings.ContainsAny(seed, "\x00\n") ||
+				!slices.ContainsFunc(seedExtensions, func(ext string) bool { return strings.HasSuffix(seed, ext) }) {
+				return p, fmt.Errorf("%s: seed.postgres must be a .sql, .sql.gz or .dump file inside the repository", FileName)
+			}
+			p.SeedPostgres = filepath.ToSlash(filepath.Clean(seed))
+		}
 		if c.Services != nil {
 			if p.Services, err = services.Normalize(*c.Services); err != nil {
 				return p, fmt.Errorf("%s: %w", FileName, err)
 			}
 			p.Source = FileName
-			return p, nil
 		}
 	}
-	p.Services, p.Source = Detect(dir)
+	if p.Source == "" {
+		p.Services, p.Source = Detect(dir)
+	}
+	if p.SeedPostgres != "" && !slices.Contains(p.Services, "postgres") {
+		return p, fmt.Errorf("%s: seed.postgres needs the postgres service", FileName)
+	}
 	return p, nil
 }
 

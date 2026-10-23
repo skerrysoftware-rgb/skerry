@@ -25,6 +25,8 @@ type guestDialer struct {
 	c    *agent.Client
 	// open holds forwarded connections, so stopping ends them too.
 	open map[net.Conn]bool
+	// act counts forwarded connections as use, for idle stop.
+	act *activity
 }
 
 // track records conn until it is closed; false means the dialer is
@@ -124,6 +126,7 @@ func (d *guestDialer) listen(hostPort, guestPort uint16) (net.Listener, error) {
 					return
 				}
 				defer d.track(c, false)
+				defer d.act.begin()()
 				g, err := d.dial(guestPort)
 				if err != nil {
 					c.Close()
@@ -135,6 +138,12 @@ func (d *guestDialer) listen(hostPort, guestPort uint16) (net.Listener, error) {
 	}()
 	return l, nil
 }
+
+// halfCloseGrace is how long the other direction may go on after one
+// direction of a forwarded connection ends. A peer that never finishes (a
+// guest holding a connection open) would otherwise keep it, and the
+// workspace, busy forever.
+const halfCloseGrace = 30 * time.Second
 
 // pipe copies both ways, passing half-closes through, then closes both.
 func pipe(a, b net.Conn) {
@@ -153,7 +162,10 @@ func pipe(a, b net.Conn) {
 	go cp(a, b)
 	go cp(b, a)
 	<-done
-	<-done
+	select {
+	case <-done:
+	case <-time.After(halfCloseGrace):
+	}
 	a.Close()
 	b.Close()
 }

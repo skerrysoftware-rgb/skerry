@@ -33,7 +33,7 @@ things:
 
 > **Status: early development, macOS on Apple Silicon.** Workspaces, Claude
 > Code integration, per-workspace VMs, networking and services work today.
-> Database seeding and Linux hosts are next. See
+> Linux hosts are next. See
 > [What works today](#what-works-today).
 
 ---
@@ -119,8 +119,9 @@ The design, threat model and measurements are in
 | ✅ Services: Postgres 17 + pgvector, Valkey, Temporal; data kept per workspace | ready in ~6 s |
 | ✅ Detecting services from `package.json`, compose files, `go.mod`, Python files; `skerry.yaml` overrides | |
 | ✅ Images built only from signature-verified Wolfi and Alpine packages | |
-| 🚧 Database seeding from a dump, with migrations applied | next |
-| 🚧 Idle shutdown, memory limits, file-change events for hot reload | |
+| ✅ Seeding from a dump, setup commands (migrations), snapshots cloned per workspace | |
+| ✅ Hot reload: file changes on your Mac reach watchers in the VM | |
+| ✅ Idle VMs stop by themselves; CPU and memory limits | |
 | 🚧 Linux hosts; cloud and self-hosted runners | |
 
 ## Requirements
@@ -197,6 +198,17 @@ Install the hooks at user level, not in a project: inside a worktree, Claude
 Code reads the project settings committed in that worktree, so project-level
 hooks don't follow sessions there. `bin/skerry claude uninstall` removes them.
 
+**Or install the Claude Code plugin**, which carries the same three hooks
+(skerry itself must still be installed and on your `PATH`):
+
+```text
+/plugin marketplace add skerrysoftware-rgb/skerry
+/plugin install skerry@skerry
+```
+
+Use one or the other, not both: two `WorktreeCreate` hooks would both try
+to make the worktree.
+
 ## Services and `skerry.yaml`
 
 skerry looks at the files a project already has and starts what it uses:
@@ -213,6 +225,40 @@ To choose explicitly, add a `skerry.yaml` at the repository root:
 services: [postgres, temporal]   # [] turns detection off
 ports: [3000]                    # also forward these ports from the VM
 ```
+
+## Seeding and setup
+
+A workspace can start with real data, migrated for its own branch:
+
+```yaml
+seed:
+  postgres: db/seed.sql.gz   # .sql, .sql.gz or a pg_dump .dump, in the repository
+setup:                       # run in the VM, in the checkout, when the data is new
+  - npm ci
+  - npm run migrate
+```
+
+When a workspace's data is new, skerry loads the seed (only into an empty
+database), then runs the setup commands, and records the result
+(`skerry status`, `skerry logs setup`). Commands that need the workspace
+wait for setup to finish. `skerry setup` runs it again, for example after
+pulling new migrations.
+
+Dumps that aren't in the repository, such as an anonymized copy of
+production, load from your Mac: `skerry reset --empty`, then
+`skerry seed ~/dumps/prod.dump`. To avoid loading a large dump into every
+workspace, load it once and save a snapshot:
+
+```bash
+skerry seed ~/dumps/prod.dump    # in one workspace; setup then migrates it
+skerry snapshot save             # saves it as the repository's default
+```
+
+Every new workspace of the repository then starts from the snapshot, as
+an APFS clone that is instant and takes no space until it changes, and
+runs its own branch's setup on top. `skerry reset` returns a workspace to
+the snapshot; `skerry reset --empty` to nothing. `skerry snapshot ls` and
+`skerry snapshot rm NAME` manage them.
 
 The variables are set in the environment of every command in the VM, so
 they take precedence over the same names in a `.env` file: dotenv loaders
@@ -237,6 +283,28 @@ ports get a URL such as `http://checkout.localhost:53165`: browsers resolve
 cookies apart from other local apps'. Temporal has no password, so its
 ports are forwarded only if you list them (`ports: [8233]` for the UI).
 
+## Hot reload, idle stop and the status line
+
+Watchers in a VM (dev servers, test runners) see edits you make on your
+Mac: skerry watches the checkout and raises a file event in the VM for
+each changed file (for a new or deleted file, an event on its directory). Changes under `.git`, `node_modules`, `dist`, `build` and similar
+output directories aren't forwarded.
+
+A workspace that nothing has used for 30 minutes (no command running
+through skerry, no forwarded connection) stops its VM; the next command
+starts it again. Its data stays. Forwarded ports don't start it: after an
+idle stop, run `skerry up` before connecting from a database tool.
+
+To see the workspace in Claude Code's status line, add this to
+`~/.claude/settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "skerry statusline" }
+```
+
+It prints, for example, `skerry checkout: running · postgres, temporal`,
+and nothing outside skerry workspaces.
+
 ## Commands
 
 | Command | What it does |
@@ -250,7 +318,11 @@ ports are forwarded only if you list them (`ports: [8233]` for the UI).
 | `skerry status [NAME]` | Show its services and the ports they are forwarded to |
 | `skerry url [-w NAME] SERVICE` | Print a URL for a service, for tools on your Mac |
 | `skerry logs [-w NAME] [-f] SERVICE` | Show a service's log; `console` and `network` show the VM's console and refused connections |
-| `skerry reset [NAME]` | Delete the workspace's service data |
+| `skerry reset [NAME] [--snapshot S \| --empty]` | Replace the workspace's service data: as a new workspace's, a snapshot's, or empty |
+| `skerry setup [NAME]` | Run the project's seed and setup commands again |
+| `skerry seed [-w NAME] FILE` | Load a `.sql`, `.sql.gz` or `.dump` file from your Mac into the workspace's empty Postgres |
+| `skerry snapshot save [S]` / `ls` / `rm S` | Save the workspace's service data for new workspaces (`default`), list or delete snapshots |
+| `skerry gc` | Delete images and downloads no workspace needs |
 | `skerry rm NAME [--force]` | Remove a workspace; `--force` discards uncommitted changes but never deletes a branch with commits |
 | `skerry claude install` / `uninstall` | Add or remove the Claude Code hooks |
 
@@ -263,6 +335,9 @@ Settings, through environment variables for now:
 | `SKERRY_BRANCH_PREFIX` | Prefix for new branches (default `worktree-`) |
 | `SKERRY_SHIMS=off` | Make the shims always run your Mac's own binaries |
 | `SKERRY_HOME` | Keep all of skerry's state and caches under one directory |
+| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused this long (default `30m`; `off` never). The next command starts it again |
+| `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`; at most all CPUs and half the Mac's memory) |
+| `SKERRY_FILE_EVENTS=off` | Don't forward file changes from your Mac to watchers in the VM |
 
 ## Security
 
@@ -321,6 +396,12 @@ Workspaces run untrusted code, so skerry is built to contain it.
   it can send requests to other services on your Mac's loopback interface,
   as any local web app can. Open workspace apps through their
   `*.localhost` URLs.
+- A snapshot's data reaches every new workspace of its repository, whatever
+  branch it is on, and code in those VMs can reach the internet. Don't save
+  data in a snapshot that you wouldn't give to every branch you check out
+  (an outside contributor's included).
+- Setup commands from `skerry.yaml` run in the VM, without asking, when a
+  workspace's data is new, as `npm install` would.
 - A VM can reach anything public, from your Mac's public address: code in
   it can send what it can read (the checkout) to the internet, and reach
   services that trust your IP address or a public range routed over your

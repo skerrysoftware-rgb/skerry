@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/agent"
 	"github.com/skerrysoftware-rgb/skerry/internal/guard"
@@ -336,6 +339,16 @@ func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env
 	if len(st.Services) > 0 {
 		fmt.Fprintf(env.Stdout, "services: %s (%s)\n", strings.Join(st.Services, ", "), st.Source)
 	}
+	if setup := v.SetupStatus(ws); setup != "" {
+		fmt.Fprintf(env.Stdout, "setup: %s\n", termsafe.Clean(setup))
+	}
+	if snaps, err := v.Snapshots(ws.Repo); err == nil && len(snaps) > 0 {
+		var names []string
+		for _, s := range snaps {
+			names = append(names, s.Name)
+		}
+		fmt.Fprintf(env.Stdout, "snapshots: %s\n", strings.Join(names, ", "))
+	}
 	if len(st.Forwards) > 0 {
 		tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "\nPORT\tIN VM\tON THIS MAC")
@@ -419,7 +432,7 @@ func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 		return err
 	}
 	if len(pos) != 1 || *lines < 1 {
-		return fmt.Errorf("%w: logs needs one of: %s, console, network", errUsage, strings.Join(services.Names(), ", "))
+		return fmt.Errorf("%w: logs needs one of: %s, setup, console, network", errUsage, strings.Join(services.Names(), ", "))
 	}
 	var wsArgs []string
 	if *name != "" {
@@ -438,7 +451,7 @@ func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 		tail = append(tail, "-F") // logs are rotated by renaming
 	}
 	switch pos[0] {
-	case "console", "network":
+	case "console", "network", "setup":
 		// Host-side logs; tail runs on this Mac.
 		cmd := exec.CommandContext(ctx, "/usr/bin/tail", append(tail[1:], filepath.Join(v.StateDir(ws), pos[0]+".log"))...)
 		cmd.Stdout, cmd.Stderr = &termsafe.Writer{W: env.Stdout}, &termsafe.Writer{W: env.Stderr}
@@ -474,9 +487,14 @@ func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 func cmdReset(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
 	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "don't ask for confirmation")
+	snapshot := fs.String("snapshot", "", "start over from this snapshot")
+	empty := fs.Bool("empty", false, "start over empty, even if the repository has a default snapshot")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
+	}
+	if *snapshot != "" && *empty {
+		return fmt.Errorf("%w: --snapshot and --empty don't go together", errUsage)
 	}
 	ws, err := resolveWorkspace(ctx, m, pos, env)
 	if err != nil {
@@ -489,13 +507,196 @@ func cmdReset(ctx context.Context, m *workspace.Manager, args []string, env Env)
 	if err != nil {
 		return err
 	}
+	if *snapshot != "" && !v.HasSnapshot(ws.Repo, *snapshot) {
+		return fmt.Errorf("no snapshot named %s; see skerry snapshot ls", *snapshot)
+	}
+	if v.SetupBusy(ws) {
+		return fmt.Errorf("%s is being set up; reset it when setup has finished", ws.Name)
+	}
 	if err := v.Down(ws); err != nil {
 		return err
 	}
-	if err := v.ResetData(ws); err != nil {
+	if err := v.ResetData(ws, *snapshot, !*empty); err != nil {
 		return err
 	}
-	fmt.Fprintf(env.Stdout, "%s's service data is deleted; services start empty at the next start\n", ws.Name)
+	switch {
+	case *snapshot != "":
+		fmt.Fprintf(env.Stdout, "%s's service data is now a copy of snapshot %s; setup runs again at the next start\n", ws.Name, *snapshot)
+	default:
+		fmt.Fprintf(env.Stdout, "%s's service data is deleted; it starts over, and setup runs again, at the next start\n", ws.Name)
+	}
+	return nil
+}
+
+// cmdSnapshot saves, lists and deletes a repository's data snapshots.
+func cmdSnapshot(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	if len(args) == 0 {
+		return fmt.Errorf("%w: snapshot needs save, ls or rm", errUsage)
+	}
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	pos, err := parse(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	v, err := newVMM(env, true)
+	if err != nil {
+		return err
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil && args[0] != "save" && *name == "" {
+		// Listing and deleting work from the repository itself too, even
+		// once it has no workspaces left.
+		wd, werr := env.Getwd()
+		if werr != nil {
+			return err
+		}
+		root, rerr := m.Git.MainRoot(ctx, wd)
+		if rerr != nil {
+			return err
+		}
+		if ws.Repo, rerr = workspace.Canonical(root); rerr != nil {
+			return err
+		}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "save":
+		if v.SetupBusy(ws) {
+			return fmt.Errorf("%s is being set up; save the snapshot when setup has finished (skerry logs setup)", ws.Name)
+		}
+		snap := vmm.DefaultSnapshot
+		if len(pos) > 1 {
+			return fmt.Errorf("%w: snapshot save takes at most one name", errUsage)
+		}
+		if len(pos) == 1 {
+			snap = pos[0]
+		}
+		proj, err := project.Load(ws.Path)
+		if err != nil {
+			return err
+		}
+		wasRunning := v.Running(ws)
+		if err := v.Down(ws); err != nil {
+			return err
+		}
+		if err := v.SaveSnapshot(ws, snap, proj.Services); err != nil {
+			return err
+		}
+		fmt.Fprintf(env.Stdout, "saved %s's service data as snapshot %s\n", ws.Name, snap)
+		if snap == vmm.DefaultSnapshot {
+			fmt.Fprintln(env.Stdout, "new workspaces of this repository start from it")
+		}
+		if wasRunning {
+			c, err := v.Up(ctx, ws)
+			if err != nil {
+				return err
+			}
+			c.Close()
+		}
+		return nil
+	case "ls", "list":
+		list, err := v.Snapshots(ws.Repo)
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			fmt.Fprintln(env.Stdout, "no snapshots")
+			return nil
+		}
+		tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tFROM\tSERVICES\tSAVED")
+		for _, s := range list {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, s.Workspace, strings.Join(s.Services, ", "), s.Created.Local().Format(time.DateTime))
+		}
+		return tw.Flush()
+	case "rm", "remove":
+		if len(pos) != 1 {
+			return fmt.Errorf("%w: snapshot rm takes one name", errUsage)
+		}
+		if err := v.RemoveSnapshot(ws.Repo, pos[0]); err != nil {
+			return err
+		}
+		fmt.Fprintf(env.Stdout, "deleted snapshot %s\n", pos[0])
+		return nil
+	}
+	return fmt.Errorf("%w: snapshot needs save, ls or rm", errUsage)
+}
+
+// cmdSetup runs the project's seed and setup commands again.
+func cmdSetup(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	pos, err := parse(flag.NewFlagSet("setup", flag.ContinueOnError), args)
+	if err != nil {
+		return err
+	}
+	ws, err := resolveWorkspace(ctx, m, pos, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, true)
+	if err != nil {
+		return err
+	}
+	if err := v.ForgetSetup(ws); err != nil {
+		return err
+	}
+	proj, err := project.Load(ws.Path)
+	if err != nil {
+		return err
+	}
+	c, err := v.Up(ctx, ws)
+	if err != nil {
+		return err
+	}
+	c.Close()
+	status := v.SetupStatus(ws)
+	switch {
+	case len(proj.Setup) == 0 && proj.SeedPostgres == "":
+		fmt.Fprintln(env.Stdout, "this project has no seed or setup commands in skerry.yaml")
+	case status == "":
+		return errors.New("setup did not finish (the workspace stopped, or was interrupted); run skerry setup again")
+	case strings.HasPrefix(status, "failed"):
+		return fmt.Errorf("setup %s; see skerry logs setup", termsafe.Clean(status))
+	default:
+		fmt.Fprintf(env.Stdout, "setup: %s\n", status)
+	}
+	return nil
+}
+
+// cmdSeed loads a database dump from this Mac into the workspace.
+func cmdSeed(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("seed", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("%w: seed takes one dump file (.sql, .sql.gz or .dump)", errUsage)
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, true)
+	if err != nil {
+		return err
+	}
+	if err := v.Seed(ctx, ws, pos[0], &termsafe.Writer{W: env.Stderr}); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "loaded %s into %s\n", pos[0], ws.Name)
 	return nil
 }
 
@@ -523,4 +724,50 @@ func cmdGC(m *workspace.Manager, args []string, env Env) error {
 	}
 	fmt.Fprintf(env.Stdout, "deleted %d images and %d downloaded packages\n", images, packages)
 	return err
+}
+
+// cmdStatusline prints one line about the workspace Claude Code is in, for
+// its status line ("statusLine": {"type": "command", "command": "skerry
+// statusline"}). It reads Claude's JSON on stdin, never starts anything,
+// and prints nothing outside skerry workspaces.
+func cmdStatusline(m *workspace.Manager, env Env) error {
+	var in struct {
+		Cwd       string `json:"cwd"`
+		Workspace struct {
+			CurrentDir string `json:"current_dir"`
+		} `json:"workspace"`
+	}
+	_ = json.NewDecoder(io.LimitReader(env.Stdin, 1<<20)).Decode(&in)
+	dir := in.Workspace.CurrentDir
+	if dir == "" {
+		dir = in.Cwd
+	}
+	if dir == "" {
+		var err error
+		if dir, err = env.Getwd(); err != nil {
+			return nil
+		}
+	}
+	ws, err := m.Find(dir)
+	if err != nil || ws.Mode != registry.ModeSkerry {
+		return nil
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return nil
+	}
+	line := "skerry " + ws.Name + ": "
+	if !v.Running(ws) {
+		line += "stopped"
+	} else {
+		line += "running"
+		if st, _, err := v.Status(ws); err == nil && len(st.Services) > 0 {
+			line += " · " + strings.Join(st.Services, ", ")
+		}
+		if setup := v.SetupStatus(ws); strings.HasPrefix(setup, "failed") {
+			line += " · setup failed"
+		}
+	}
+	fmt.Fprintln(env.Stdout, termsafe.Clean(line))
+	return nil
 }

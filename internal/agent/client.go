@@ -106,6 +106,13 @@ func (c *Client) DialGuest(port uint16) (net.Conn, error) {
 	}
 }
 
+// Touch tells the agent which files (relative to the workspace) changed on
+// the host. It doesn't wait for an answer.
+func (c *Client) Touch(paths []string) error {
+	_, _, err := c.conn.SendRequest(RequestTouch, false, []byte(strings.Join(paths, "\x00")))
+	return err
+}
+
 // Poweroff asks the guest to shut down cleanly.
 func (c *Client) Poweroff() error {
 	return c.bounded("a poweroff request", func() error {

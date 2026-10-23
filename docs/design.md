@@ -61,7 +61,7 @@ developer may have five Claude sessions in five worktrees, all fighting over
 | **Preset** | A packaged service definition (`postgres@17`, `redis@8`, `temporal-dev`) with readiness checks and connection outputs. |
 | **Seed** | The source for a database's initial data (a dump directory, file, URL or command). |
 | **Snapshot** | A stopped, read-only Postgres data disk built from a seed, cloned copy-on-write into workspaces. |
-| **Trust** | A per-repository approval that lets skerry run that repository's commands. Tied to a hash of the plan's commands. |
+| **Enabled folder** | A folder where skerry is switched on. Checkouts under it become workspaces, and enabling it is also the approval for skerry to run those projects' commands (inside VMs). Everywhere else skerry creates plain worktrees and runs nothing. |
 
 ## 4. User experience
 
@@ -91,7 +91,7 @@ commands run inside it.
 │ Claude Code ── hooks ──► skerry (CLI)         │       │ skerry-agent (PID 1)                    │
 │   Bash tool ── shims ──►   │                  │       │   ├─ mounts: /work (checkout, virtiofs) │
 │                            ▼                  │       │   │          / (base rootfs, ro + overlay)│
-│ registry, trust, plans  skerry vm <ws>  ──────┼─vsock─┤   │          /data (disk, ext4)          │
+│ registry, scope, plans  skerry vm <ws>  ──────┼─vsock─┤   │          /data (disk, ext4)          │
 │ (state dir, 0700)        (one process per VM) │  ssh  │   ├─ exec server (SSH over vsock)       │
 │                            │  VZ / CH driver  │       │   ├─ service supervisor (lazy start)    │
 │                            │  network stack ──┼──net──┤   ├─ file-event replayer                │
@@ -113,7 +113,7 @@ commands run inside it.
 ### 6.1 CLI
 
 A single static Go binary. Subcommands: `create`, `ls`, `rm`, `watch`,
-`status`, `exec`, `up`, `down`, `trust`, `seed`, `doctor`, `claude install`,
+`status`, `exec`, `up`, `down`, `enable`, `disable`, `seed`, `doctor`, `claude install`,
 and internal ones (`hook …`, `vm …`). Hook subcommands read Claude's JSON on
 stdin and print only what Claude expects on stdout. All logs go to stderr.
 
@@ -301,6 +301,26 @@ their workspace clones, and support an optional scrub step.
 
 ### 6.10 Claude Code integration
 
+**skerry is opt-in per folder.** `skerry enable DIR` switches it on for every
+repository under `DIR`; `skerry claude install` asks which folders to enable.
+Elsewhere, skerry's hooks create plain worktrees exactly as Claude Code does by
+default, and nothing else happens:
+
+- worktree at `.claude/worktrees/<name>` on branch `worktree-<name>`
+- starting from the remote's default branch (`origin/HEAD`), or the current
+  `HEAD` when there is none (`SKERRY_BASE=head` always uses `HEAD`, like
+  Claude Code's `worktree.baseRef: "head"`)
+- asking again for an existing name reopens that worktree
+- gitignored files matching `.worktreeinclude` are copied in
+- the repository's own filter drivers and file-system monitor never run
+  during creation (Claude Code does the same for filters); its git hooks
+  don't run either unless `SKERRY_GIT_HOOKS=1`, because anything that can
+  write to the repository, an agent included, could have planted them
+
+In a plain worktree, the first session per repository gets one line of
+context telling Claude that skerry exists and how to enable it.
+
+
 Verified in the spike: the CLI's `--worktree` **and the desktop app's worktree
 sessions** call `WorktreeCreate` and use the path it returns. Hooks configured
 in a trusted repository's project settings also fire.
@@ -406,7 +426,7 @@ single bug does not hand over the host.
 | Other workspaces | A compromised workspace | Separate VMs, disks and network stacks; per-repository caches |
 | Host network services, LAN, cloud metadata | Guest network access | Default-deny policy enforced after DNS resolution |
 | skerry control | Other local users; malicious web pages | Control only over `0600` Unix sockets; no TCP control port; dashboard read-only with token and Origin/Host checks |
-| The host itself | A malicious repository at checkout | Workspace trust; detectors never execute code; repository commands only run inside the VM; repository config cannot request host access |
+| The host itself | A malicious repository at checkout | Opt-in enabled folders; repository git hooks and filter drivers off during worktree creation; detectors never execute code; repository commands only run inside the VM; repository config cannot request host access |
 | Supply chain | Tampered packages, images or releases | Signature-verified Alpine packages; checksum-pinned downloads; Go checksum database; signed releases with SBOM and provenance |
 | Seed data | Leaks of copied production-like data | `0700` storage, no publishing, deletion with workspaces, optional scrubbing |
 | Multi-tenant cloud | Cross-tenant access | VM per session; runner bound to one owner; firecracker jailer; no pre-warmed VM holds owner data |
@@ -426,7 +446,9 @@ single bug does not hand over the host.
    registry under skerry's or the repository's worktree root, never a path
    taken from input.
 6. Nothing from a repository executes on the host.
-7. Untrusted repositories get a plain worktree and no provisioning.
+7. Outside enabled folders, skerry creates plain worktrees and provisions
+   nothing. During worktree creation, git never runs the repository's filter
+   drivers, file-system monitor or (unless the user opts in) hooks.
 8. Control sockets and state are readable only by the user.
 9. No listener binds a non-loopback address.
 10. Secrets never reach disk images, logs or snapshots.
@@ -519,7 +541,7 @@ Findings from the review before building, and what changed.
 | # | Severity | Finding | Resolution |
 |---|---|---|---|
 | 1 | Blocker | libkrun's guest reaches host resources with the VM process's permissions; TSI gives the guest the host's network; macOS has no namespaces | vz on macOS, cloud-hypervisor on Linux, firecracker for cloud; libkrun optional, only inside namespaces |
-| 2 | Blocker | Repository config and detected steps would run untrusted code at checkout | Workspace trust; detectors never execute; commands only in the VM; repository config cannot request host access |
+| 2 | Blocker | Repository config and detected steps would run untrusted code at checkout | Opt-in enabled folders; detectors never execute; commands only in the VM; repository config cannot request host access |
 | 3 | Blocker | Rewriting Claude's Bash commands breaks compound commands, permission rules and other hooks | Command shims on `PATH` via `CLAUDE_ENV_FILE`; `git`/`gh` stay on the host |
 | 4 | Blocker | Unknown whether the desktop app fires `WorktreeCreate` | Verified: it does |
 | 5 | High | Host edits don't reach guest watchers | Event forwarding with timestamp re-apply (§6.13); verified feasible |
@@ -546,7 +568,7 @@ Findings from the review before building, and what changed.
 
 | Milestone | Contents | Done when |
 |---|---|---|
-| M1 Foundation | CLI, state, registry, trust, git worktrees, Claude hooks, `skerry claude install` | Claude worktree sessions are created and removed through skerry |
+| M1 Foundation | CLI, state, registry, opt-in scope, git worktrees, Claude hooks, `skerry claude install` | Claude worktree sessions are created and removed through skerry |
 | M2 VM core | vz driver, image builder from verified packages, agent, SSH exec over vsock, shims | `yarn --version` from a Claude session runs inside the workspace VM |
 | M3 Network | Per-workspace stack, egress policy, loopback forwards, `*.localhost` proxy | Policy tests pass; Postgres reachable from host tools |
 | M4 Services | Presets (Postgres 17 + pgvector, Redis, Temporal, Node), supervisor, lazy start, readiness | `skerry wait postgres` works; services start on connect |
@@ -566,7 +588,7 @@ cmd/skerry/          entry point
 internal/cli/        subcommands
 internal/workspace/  registry, lifecycle
 internal/gitx/       git operations
-internal/trust/      trust store
+internal/scope/      enabled folders
 internal/hook/       Claude hook handlers
 internal/claude/     settings install
 internal/engine/     driver interface + vz, …

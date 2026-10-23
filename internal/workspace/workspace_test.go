@@ -9,15 +9,15 @@ import (
 	"testing"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
+	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 	"github.com/skerrysoftware-rgb/skerry/internal/testutil"
-	"github.com/skerrysoftware-rgb/skerry/internal/trust"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
 func newManager(t *testing.T) *workspace.Manager {
 	t.Helper()
 	state := t.TempDir()
-	return &workspace.Manager{Registry: registry.Open(state), Trust: trust.Open(state)}
+	return &workspace.Manager{Registry: registry.Open(state), Scope: scope.Open(state)}
 }
 
 func TestValidateName(t *testing.T) {
@@ -59,10 +59,10 @@ func TestCreate(t *testing.T) {
 	if want := filepath.Join(root, ".claude", "worktrees", "fix-login"); ws.Path != want {
 		t.Errorf("path = %s, want %s", ws.Path, want)
 	}
-	if ws.Branch != "wip/fix-login" {
-		t.Errorf("branch = %s", ws.Branch)
+	if ws.Branch != "worktree-fix-login" || ws.Mode != registry.ModePlain {
+		t.Errorf("branch = %s, mode = %s", ws.Branch, ws.Mode)
 	}
-	if got := testutil.Git(t, ws.Path, "rev-parse", "--abbrev-ref", "HEAD"); got != "wip/fix-login" {
+	if got := testutil.Git(t, ws.Path, "rev-parse", "--abbrev-ref", "HEAD"); got != "worktree-fix-login" {
 		t.Errorf("worktree is on %s", got)
 	}
 	if got := testutil.Git(t, root, "rev-parse", "HEAD"); ws.Base != got {
@@ -77,8 +77,15 @@ func TestCreate(t *testing.T) {
 		t.Errorf("Find inside workspace = %+v, %v", found, err)
 	}
 
-	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "fix-login"}); err == nil {
-		t.Error("creating the same name twice succeeded")
+	// Asking again for the same name reopens it, as Claude Code does.
+	again, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "fix-login"})
+	if err != nil || again.ID != ws.ID {
+		t.Errorf("second Create = %+v, %v; want the existing workspace", again, err)
+	}
+	// A directory skerry didn't create is never adopted.
+	testutil.WriteFile(t, filepath.Join(root, ".claude", "worktrees", "foreign", "x"), "x")
+	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "foreign"}); err == nil {
+		t.Error("Create adopted a directory skerry did not create")
 	}
 }
 
@@ -114,7 +121,23 @@ func TestCreateRefusesSymlinkedWorktreesDir(t *testing.T) {
 	}
 }
 
-func TestCreateRunsRepoHooksOnlyWhenTrusted(t *testing.T) {
+func TestModeFollowsScope(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	m := newManager(t)
+	if err := m.Scope.Enable(filepath.Dir(root)); err != nil { // a parent folder
+		t.Fatal(err)
+	}
+	ws, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "on"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Mode != registry.ModeSkerry {
+		t.Errorf("mode under an enabled folder = %s", ws.Mode)
+	}
+}
+
+func TestGitHooksAreOptIn(t *testing.T) {
 	ctx := context.Background()
 	root := testutil.NewRepo(t)
 	marker := filepath.Join(t.TempDir(), "hook-ran")
@@ -124,22 +147,101 @@ func TestCreateRunsRepoHooksOnlyWhenTrusted(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := newManager(t)
+	if err := m.Scope.Enable(root); err != nil {
+		t.Fatal(err)
+	}
 
-	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "untrusted"}); err != nil {
+	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "default"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("repository hook ran for an untrusted repository")
+		t.Fatal("repository hook ran without opting in")
 	}
 
-	if err := m.Trust.Trust(root); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "trusted"}); err != nil {
+	m.GitHooks = true
+	if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "opted-in"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatal("repository hook did not run for a trusted repository")
+		t.Fatal("repository hook did not run after opting in")
+	}
+}
+
+func TestFilterDriversDoNotRun(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	testutil.WriteFile(t, filepath.Join(root, ".gitattributes"), "*.txt filter=evil\n")
+	testutil.WriteFile(t, filepath.Join(root, "data.txt"), "real content\n")
+	testutil.Git(t, root, "add", ".")
+	testutil.Git(t, root, "commit", "--quiet", "-m", "data")
+	marker := filepath.Join(t.TempDir(), "filter-ran")
+	testutil.Git(t, root, "config", "filter.evil.smudge", "touch '"+marker+"'; cat")
+	testutil.Git(t, root, "config", "filter.evil.process", "touch '"+marker+"'; false")
+	testutil.Git(t, root, "config", "filter.evil.required", "true")
+
+	ws, err := newManager(t).Create(ctx, workspace.CreateOptions{From: root, Name: "filtered"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a filter driver from the repository's config ran")
+	}
+	if got, _ := os.ReadFile(filepath.Join(ws.Path, "data.txt")); string(got) != "real content\n" {
+		t.Errorf("data.txt = %q", got)
+	}
+}
+
+func TestBaseIsRemoteDefaultBranch(t *testing.T) {
+	ctx := context.Background()
+	upstream := testutil.NewRepo(t)
+	clone := filepath.Join(filepath.Dir(upstream), "clone")
+	testutil.Git(t, filepath.Dir(upstream), "clone", "--quiet", upstream, clone)
+	remoteHead := testutil.Git(t, clone, "rev-parse", "HEAD")
+	testutil.WriteFile(t, filepath.Join(clone, "local.txt"), "unpushed\n")
+	testutil.Git(t, clone, "add", "local.txt")
+	testutil.Git(t, clone, "commit", "--quiet", "-m", "local only")
+	localHead := testutil.Git(t, clone, "rev-parse", "HEAD")
+
+	m := newManager(t)
+	fresh, err := m.Create(ctx, workspace.CreateOptions{From: clone, Name: "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Base != remoteHead {
+		t.Errorf("default base = %s, want origin/HEAD %s", fresh.Base, remoteHead)
+	}
+	m.BaseFromHead = true
+	head, err := m.Create(ctx, workspace.CreateOptions{From: clone, Name: "head"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Base != localHead {
+		t.Errorf("head base = %s, want local HEAD %s", head.Base, localHead)
+	}
+}
+
+func TestWorktreeIncludeCopiesIgnoredFilesOnly(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	testutil.WriteFile(t, filepath.Join(root, ".gitignore"), ".env\nconfig/secret.json\n")
+	testutil.WriteFile(t, filepath.Join(root, ".worktreeinclude"), ".env\nconfig/secret.json\nnotes.txt\n")
+	testutil.Git(t, root, "add", ".gitignore", ".worktreeinclude")
+	testutil.Git(t, root, "commit", "--quiet", "-m", "include rules")
+	testutil.WriteFile(t, filepath.Join(root, ".env"), "TOKEN=abc\n")
+	testutil.WriteFile(t, filepath.Join(root, "config", "secret.json"), "{}\n")
+	testutil.WriteFile(t, filepath.Join(root, "notes.txt"), "untracked but not ignored\n")
+
+	ws, err := newManager(t).Create(ctx, workspace.CreateOptions{From: root, Name: "inc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{".env": "TOKEN=abc\n", "config/secret.json": "{}\n"} {
+		if got, err := os.ReadFile(filepath.Join(ws.Path, rel)); err != nil || string(got) != want {
+			t.Errorf("%s = %q, %v", rel, got, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ws.Path, "notes.txt")); err == nil {
+		t.Error("copied a file that is not gitignored")
 	}
 }
 

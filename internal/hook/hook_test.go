@@ -11,8 +11,8 @@ import (
 
 	"github.com/skerrysoftware-rgb/skerry/internal/hook"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
+	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 	"github.com/skerrysoftware-rgb/skerry/internal/testutil"
-	"github.com/skerrysoftware-rgb/skerry/internal/trust"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
@@ -27,7 +27,7 @@ func newHarness(t *testing.T) *harness {
 	state := t.TempDir()
 	h := &harness{stdout: &bytes.Buffer{}, env: map[string]string{}}
 	h.h = &hook.Handler{
-		Manager: &workspace.Manager{Registry: registry.Open(state), Trust: trust.Open(state)},
+		Manager: &workspace.Manager{Registry: registry.Open(state), Scope: scope.Open(state)},
 		Stdout:  h.stdout,
 		Stderr:  &bytes.Buffer{},
 		Getenv:  func(k string) string { return h.env[k] },
@@ -128,55 +128,102 @@ func TestWorktreeRemoveAfterManualDelete(t *testing.T) {
 	}
 }
 
-func TestSessionStart(t *testing.T) {
+type sessionOutput struct {
+	HookSpecificOutput struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	} `json:"hookSpecificOutput"`
+}
+
+func (h *harness) sessionStart(t *testing.T, cwd string) (sessionOutput, bool) {
+	t.Helper()
+	if err := h.run(t, "session-start", map[string]any{"cwd": cwd, "hook_event_name": "SessionStart", "source": "startup"}); err != nil {
+		t.Fatal(err)
+	}
+	if h.stdout.Len() == 0 {
+		return sessionOutput{}, false
+	}
+	var out sessionOutput
+	if err := json.Unmarshal(h.stdout.Bytes(), &out); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, h.stdout.String())
+	}
+	if out.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Fatalf("hookEventName = %q", out.HookSpecificOutput.HookEventName)
+	}
+	return out, true
+}
+
+func (h *harness) create(t *testing.T, root, name string) string {
+	t.Helper()
+	if err := h.run(t, "worktree-create", map[string]any{"cwd": root, "hook_event_name": "WorktreeCreate", "name": name}); err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(h.stdout.String())
+}
+
+func TestSessionStartOutsideWorkspace(t *testing.T) {
 	root := testutil.NewRepo(t)
 	h := newHarness(t)
 	envFile := filepath.Join(t.TempDir(), "env")
 	h.env["CLAUDE_ENV_FILE"] = envFile
-
-	// Outside any workspace: no output, no env.
-	if err := h.run(t, "session-start", map[string]any{"cwd": root, "hook_event_name": "SessionStart", "source": "startup"}); err != nil {
-		t.Fatal(err)
-	}
-	if h.stdout.Len() != 0 {
+	if _, printed := h.sessionStart(t, root); printed {
 		t.Fatalf("output outside a workspace: %q", h.stdout.String())
 	}
 	if _, err := os.Stat(envFile); !os.IsNotExist(err) {
 		t.Fatal("wrote env outside a workspace")
 	}
+}
 
-	if err := h.run(t, "worktree-create", map[string]any{"cwd": root, "hook_event_name": "WorktreeCreate", "name": "it's"}); err == nil {
-		t.Fatal("quote in name accepted")
+func TestSessionStartPlainHintsOnce(t *testing.T) {
+	root := testutil.NewRepo(t)
+	h := newHarness(t)
+	envFile := filepath.Join(t.TempDir(), "env")
+	h.env["CLAUDE_ENV_FILE"] = envFile
+
+	first := h.create(t, root, "one")
+	out, printed := h.sessionStart(t, first)
+	if !printed || !strings.Contains(out.HookSpecificOutput.AdditionalContext, "skerry enable "+root) {
+		t.Fatalf("first plain session: printed=%v context=%q", printed, out.HookSpecificOutput.AdditionalContext)
 	}
-	if err := h.run(t, "worktree-create", map[string]any{"cwd": root, "hook_event_name": "WorktreeCreate", "name": "ws1"}); err != nil {
+	second := h.create(t, root, "two")
+	if _, printed := h.sessionStart(t, second); printed {
+		t.Errorf("hinted twice for one repository: %q", h.stdout.String())
+	}
+	if _, err := os.Stat(envFile); !os.IsNotExist(err) {
+		t.Error("a plain worktree got skerry environment variables")
+	}
+}
+
+func TestSessionStartSkerryWorkspace(t *testing.T) {
+	root := testutil.NewRepo(t)
+	h := newHarness(t)
+	if err := h.h.Manager.Scope.Enable(root); err != nil {
 		t.Fatal(err)
 	}
-	path := strings.TrimSpace(h.stdout.String())
+	envFile := filepath.Join(t.TempDir(), "env")
+	h.env["CLAUDE_ENV_FILE"] = envFile
 
-	if err := h.run(t, "session-start", map[string]any{"cwd": path, "hook_event_name": "SessionStart", "source": "startup"}); err != nil {
-		t.Fatal(err)
-	}
-	var out struct {
-		HookSpecificOutput struct {
-			HookEventName     string `json:"hookEventName"`
-			AdditionalContext string `json:"additionalContext"`
-		} `json:"hookSpecificOutput"`
-	}
-	if err := json.Unmarshal(h.stdout.Bytes(), &out); err != nil {
-		t.Fatalf("output is not JSON: %v\n%s", err, h.stdout.String())
-	}
-	if out.HookSpecificOutput.HookEventName != "SessionStart" || !strings.Contains(out.HookSpecificOutput.AdditionalContext, `"ws1"`) {
-		t.Errorf("unexpected output: %+v", out)
-	}
-	if !strings.Contains(out.HookSpecificOutput.AdditionalContext, "not trusted") {
-		t.Error("context does not mention that the repository is untrusted")
+	path := h.create(t, root, "ws1")
+	for _, cwd := range []string{path, filepath.Join(path, ".git")} {
+		out, printed := h.sessionStart(t, cwd)
+		if !printed || !strings.Contains(out.HookSpecificOutput.AdditionalContext, `"ws1"`) {
+			t.Fatalf("session in %s: printed=%v context=%q", cwd, printed, out.HookSpecificOutput.AdditionalContext)
+		}
 	}
 	env, err := os.ReadFile(envFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(env) != "export SKERRY_WORKSPACE='ws1'\n" {
+	if !strings.HasPrefix(string(env), "export SKERRY_WORKSPACE='ws1'\n") {
 		t.Errorf("env file = %q", env)
+	}
+}
+
+func TestWorktreeCreateRejectsQuotes(t *testing.T) {
+	root := testutil.NewRepo(t)
+	h := newHarness(t)
+	if err := h.run(t, "worktree-create", map[string]any{"cwd": root, "hook_event_name": "WorktreeCreate", "name": "it's"}); err == nil {
+		t.Fatal("quote in name accepted")
 	}
 }
 
@@ -200,7 +247,7 @@ func FuzzHookInput(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		state := t.TempDir()
 		h := &hook.Handler{
-			Manager: &workspace.Manager{Registry: registry.Open(state), Trust: trust.Open(state)},
+			Manager: &workspace.Manager{Registry: registry.Open(state), Scope: scope.Open(state)},
 			Stdout:  &bytes.Buffer{}, Stderr: &bytes.Buffer{},
 			Getenv: func(string) string { return "" },
 		}

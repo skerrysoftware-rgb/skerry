@@ -45,12 +45,21 @@ func exitedWith(err error, code int) bool {
 
 // run executes git in dir and returns trimmed stdout.
 func (g Git) run(ctx context.Context, dir string, args ...string) (string, error) {
+	out, err := g.runInput(ctx, dir, nil, args...)
+	return strings.TrimSpace(out), err
+}
+
+// runInput executes git in dir with stdin and returns raw stdout.
+func (g Git) runInput(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
 	bin := g.Bin
 	if bin == "" {
 		bin = "git"
 	}
 	cmd := exec.CommandContext(ctx, bin, append([]string{"-C", dir}, args...)...)
 	cmd.Env = cleanEnv(os.Environ())
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -61,7 +70,82 @@ func (g Git) run(ctx context.Context, dir string, args ...string) (string, error
 		}
 		return "", fmt.Errorf("run git: %w", err)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.String(), nil
+}
+
+// guard returns -c overrides that stop git from running programs named in the
+// repository's own config while it checks out or inspects files: filter
+// drivers (such as a local Git LFS install), the file-system monitor, and,
+// unless allowHooks, the repository's hooks. Anything that can write to the
+// repository, an agent included, could have planted those.
+func (g Git) guard(ctx context.Context, repo string, allowHooks bool) ([]string, error) {
+	args := []string{"-c", "core.fsmonitor=false"}
+	if !allowHooks {
+		args = append(args, "-c", "core.hooksPath="+os.DevNull)
+	}
+	out, err := g.run(ctx, repo, "config", "--local", "--includes", "--name-only", "--get-regexp", `^filter\.`)
+	if err != nil && !exitedWith(err, 1) { // 1: no filters configured
+		return nil, fmt.Errorf("read repository git config: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, key := range strings.Fields(out) {
+		// filter.<name>.<variable>; the name itself may contain dots.
+		dot := strings.LastIndex(key, ".")
+		name := key[len("filter."):max(dot, len("filter."))]
+		if name == "" || seen[name] {
+			continue
+		}
+		if strings.ContainsAny(name, "=\n") {
+			return nil, fmt.Errorf("the repository's git config defines filter %q, which skerry cannot switch off", name)
+		}
+		seen[name] = true
+		args = append(args,
+			"-c", "filter."+name+".process=",
+			"-c", "filter."+name+".smudge=",
+			"-c", "filter."+name+".clean=",
+			"-c", "filter."+name+".required=false",
+		)
+	}
+	return args, nil
+}
+
+// DefaultBase returns the commit a new worktree starts from, as Claude Code
+// does by default: the remote's default branch, or HEAD of from when there
+// is no cached remote default.
+func (g Git) DefaultBase(ctx context.Context, from string) (string, error) {
+	if base, err := g.run(ctx, from, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD^{commit}"); err == nil && base != "" {
+		return base, nil
+	}
+	return g.Head(ctx, from)
+}
+
+// WorktreeIncludes lists untracked, gitignored files in the main checkout
+// that match the repository's .worktreeinclude patterns, relative to root.
+// Claude Code copies these (such as .env) into each new worktree.
+func (g Git) WorktreeIncludes(ctx context.Context, root string) ([]string, error) {
+	patterns := filepath.Join(root, ".worktreeinclude")
+	if info, err := os.Lstat(patterns); err != nil || !info.Mode().IsRegular() {
+		return nil, nil
+	}
+	guard, err := g.guard(ctx, root, false)
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := g.runInput(ctx, root, nil, append(guard, "ls-files", "-z", "--others", "--ignored", "--exclude-from="+patterns)...)
+	if err != nil || candidates == "" {
+		return nil, err
+	}
+	ignored, err := g.runInput(ctx, root, []byte(candidates), append(guard, "check-ignore", "-z", "--stdin")...)
+	if err != nil && !exitedWith(err, 1) { // 1: none of them are ignored
+		return nil, err
+	}
+	var files []string
+	for _, f := range strings.Split(ignored, "\x00") {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, nil
 }
 
 // cleanEnv drops variables that would point git at a different repository,
@@ -129,26 +213,31 @@ type AddWorktreeOptions struct {
 	Branch string
 	// Base is the commit the branch starts at.
 	Base string
-	// RunHooks allows the repository's git hooks (such as post-checkout) to
-	// run. skerry only allows it for trusted repositories.
+	// RunHooks lets the repository's git hooks (such as post-checkout) run.
+	// Off unless the user opts in.
 	RunHooks bool
 }
 
-// AddWorktree creates a worktree on a new branch.
+// AddWorktree creates a worktree on a new branch, with the repository's
+// filter drivers switched off (see guard).
 func (g Git) AddWorktree(ctx context.Context, o AddWorktreeOptions) error {
-	args := []string{}
-	if !o.RunHooks {
-		args = append(args, "-c", "core.hooksPath="+os.DevNull)
+	args, err := g.guard(ctx, o.From, o.RunHooks)
+	if err != nil {
+		return err
 	}
 	args = append(args, "worktree", "add", "--quiet", "-b", o.Branch, "--", o.Path, o.Base)
-	_, err := g.run(ctx, o.From, args...)
+	_, err = g.run(ctx, o.From, args...)
 	return err
 }
 
 // Dirty reports whether a worktree has uncommitted changes or untracked,
 // non-ignored files.
 func (g Git) Dirty(ctx context.Context, path string) (bool, error) {
-	out, err := g.run(ctx, path, "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=normal")
+	guard, err := g.guard(ctx, path, false)
+	if err != nil {
+		return false, err
+	}
+	out, err := g.run(ctx, path, append(guard, "status", "--porcelain=v1", "--untracked-files=normal")...)
 	if err != nil {
 		return false, err
 	}

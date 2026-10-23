@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,16 +16,15 @@ import (
 
 	"github.com/skerrysoftware-rgb/skerry/internal/gitx"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
-	"github.com/skerrysoftware-rgb/skerry/internal/trust"
+	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 )
 
 // WorktreesDir is where workspaces live inside a repository. It matches
 // Claude Code's default, so its tools find them where they expect.
 const WorktreesDir = ".claude/worktrees"
 
-// DefaultBranchPrefix starts the branch for each new workspace. Branches are
-// meant to be renamed before they are pushed.
-const DefaultBranchPrefix = "wip/"
+// DefaultBranchPrefix matches Claude Code's default worktree branch names.
+const DefaultBranchPrefix = "worktree-"
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
@@ -39,16 +39,22 @@ func ValidateName(name string) error {
 
 // Manager creates and removes workspaces.
 type Manager struct {
-	Registry     *registry.Registry
-	Trust        *trust.Store
-	Git          gitx.Git
+	Registry *registry.Registry
+	Scope    *scope.Store
+	Git      gitx.Git
+	// BranchPrefix starts each new branch; empty means DefaultBranchPrefix.
 	BranchPrefix string
-	Now          func() time.Time
+	// BaseFromHead starts workspaces at the current HEAD instead of the
+	// remote's default branch (Claude Code's worktree.baseRef "head").
+	BaseFromHead bool
+	// GitHooks lets the repository's git hooks run during worktree creation.
+	GitHooks bool
+	Now      func() time.Time
 }
 
 // CreateOptions describes a new workspace.
 type CreateOptions struct {
-	// From is a directory in the repository; the workspace starts at its HEAD.
+	// From is a directory in the repository.
 	From string
 	// Name is the workspace name.
 	Name string
@@ -56,7 +62,11 @@ type CreateOptions struct {
 	CreatedBy string
 }
 
-// Create makes a worktree on a new branch and registers it.
+// Create makes a worktree on a new branch and registers it. Inside an
+// enabled folder it is a skerry workspace; elsewhere it is a plain worktree
+// made the way Claude Code makes them by default. Asking again for a name
+// skerry already created returns the existing workspace, as Claude Code
+// reopens an existing worktree.
 func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspace, error) {
 	if err := ValidateName(o.Name); err != nil {
 		return registry.Workspace{}, err
@@ -78,8 +88,11 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 		return registry.Workspace{}, err
 	}
 	path := filepath.Join(parent, o.Name)
-	if _, err := os.Lstat(path); err == nil {
-		return registry.Workspace{}, fmt.Errorf("%s already exists", path)
+	if info, err := os.Lstat(path); err == nil {
+		if existing, err := m.Registry.FindByPath(path); err == nil && existing.Path == path && info.IsDir() {
+			return existing, nil
+		}
+		return registry.Workspace{}, fmt.Errorf("%s already exists and skerry did not create it", path)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return registry.Workspace{}, err
 	}
@@ -98,21 +111,34 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 		return registry.Workspace{}, fmt.Errorf("branch %s already exists; pick another workspace name", branch)
 	}
 
-	base, err := m.Git.Head(ctx, from)
+	var base string
+	if m.BaseFromHead {
+		base, err = m.Git.Head(ctx, from)
+	} else {
+		base, err = m.Git.DefaultBase(ctx, from)
+	}
 	if err != nil {
 		return registry.Workspace{}, fmt.Errorf("find starting commit: %w", err)
 	}
-	trusted, err := m.Trust.IsTrusted(root)
+	enabled, err := m.Scope.IsEnabled(root)
 	if err != nil {
 		return registry.Workspace{}, err
 	}
+	mode := registry.ModePlain
+	if enabled {
+		mode = registry.ModeSkerry
+	}
+
 	if err := m.Git.AddWorktree(ctx, gitx.AddWorktreeOptions{
-		From: from, Path: path, Branch: branch, Base: base, RunHooks: trusted,
+		From: from, Path: path, Branch: branch, Base: base, RunHooks: m.GitHooks,
 	}); err != nil {
 		return registry.Workspace{}, err
 	}
 	// Keep the main checkout's `git status` clean of the worktrees directory.
 	if err := m.Git.ExcludeLocally(ctx, root, WorktreesDir+"/"+o.Name, "/"+WorktreesDir+"/"); err != nil {
+		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
+	}
+	if err := m.copyIncludes(ctx, root, path); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 
@@ -122,12 +148,76 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	}
 	ws := registry.Workspace{
 		ID: id, Name: o.Name, Repo: root, Path: path, Branch: branch, Base: base,
-		CreatedBy: o.CreatedBy, CreatedAt: m.now().UTC(),
+		Mode: mode, CreatedBy: o.CreatedBy, CreatedAt: m.now().UTC(),
 	}
 	if err := m.Registry.Add(ws); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 	return ws, nil
+}
+
+// copyIncludes copies the main checkout's .worktreeinclude files into a new
+// worktree. Both sides go through os.Root, so a symlink cannot make the copy
+// read or write outside the two checkouts.
+func (m *Manager) copyIncludes(ctx context.Context, root, path string) error {
+	files, err := m.Git.WorktreeIncludes(ctx, root)
+	if err != nil || len(files) == 0 {
+		return err
+	}
+	src, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	for _, rel := range files {
+		info, err := src.Lstat(rel)
+		if err != nil {
+			return fmt.Errorf("copy %s: %w", rel, err)
+		}
+		if dir := filepath.Dir(rel); dir != "." {
+			if err := dst.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("copy %s: %w", rel, err)
+			}
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := src.Readlink(rel)
+			if err != nil {
+				return fmt.Errorf("copy %s: %w", rel, err)
+			}
+			if err := dst.Symlink(target, rel); err != nil {
+				return fmt.Errorf("copy %s: %w", rel, err)
+			}
+		case info.Mode().IsRegular():
+			if err := copyFile(src, dst, rel, info.Mode().Perm()); err != nil {
+				return fmt.Errorf("copy %s: %w", rel, err)
+			}
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst *os.Root, rel string, perm os.FileMode) error {
+	in, err := src.Open(rel)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := dst.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // rollback undoes a half-created worktree and returns the original error.

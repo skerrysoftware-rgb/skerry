@@ -142,33 +142,32 @@ func (h *Handler) sessionStart(in Input) error {
 		return err
 	}
 
-	if envFile := h.getenv("CLAUDE_ENV_FILE"); envFile != "" {
-		if err := appendEnv(envFile, map[string]string{"SKERRY_WORKSPACE": ws.Name}); err != nil {
+	var context string
+	if ws.Mode == registry.ModeSkerry {
+		if envFile := h.getenv("CLAUDE_ENV_FILE"); envFile != "" {
+			if err := appendEnv(envFile, map[string]string{"SKERRY_WORKSPACE": ws.Name}); err != nil {
+				return err
+			}
+		}
+		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s.", ws.Name, ws.Path, ws.Branch)
+	} else {
+		// A plain worktree: say once per repository that skerry is
+		// available, then stay out of the way.
+		first, err := h.Manager.Scope.FirstHint(ws.Repo)
+		if err != nil || !first {
 			return err
 		}
-	}
-
-	trusted, err := h.Manager.Trust.IsTrusted(ws.Repo)
-	if err != nil {
-		return err
+		context = fmt.Sprintf("skerry is installed but not enabled for %s, so this is a plain git worktree."+
+			" If the user wants each checkout of this project to get its own isolated environment"+
+			" (its own databases, services and dependencies in a lightweight VM), they can run `skerry enable %s`."+
+			" Mention this only if it is relevant to the task.", ws.Repo, ws.Repo)
 	}
 	return json.NewEncoder(h.Stdout).Encode(map[string]any{
 		"hookSpecificOutput": map[string]any{
 			"hookEventName":     "SessionStart",
-			"additionalContext": sessionContext(ws, trusted),
+			"additionalContext": context,
 		},
 	})
-}
-
-func sessionContext(ws registry.Workspace, trusted bool) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "This session runs in skerry workspace %q at %s, on branch %s.", ws.Name, ws.Path, ws.Branch)
-	fmt.Fprintf(&b, " The branch name is a placeholder: rename it to describe the change before pushing.")
-	if !trusted {
-		fmt.Fprintf(&b, " The repository is not trusted by skerry, so no isolated environment is provisioned;"+
-			" the user can enable it with `skerry trust %s`.", ws.Repo)
-	}
-	return b.String()
 }
 
 // appendEnv adds export lines to Claude's env file, which it sources before

@@ -18,7 +18,7 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/hook"
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
-	"github.com/skerrysoftware-rgb/skerry/internal/trust"
+	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
@@ -48,10 +48,10 @@ Usage:
   skerry create <name> [--from DIR]   create a workspace and print its path
   skerry ls                           list workspaces
   skerry rm <name> [--force]          remove a workspace
-  skerry trust [DIR] [--yes]          let skerry run this repository's commands
-  skerry untrust [DIR]                revoke trust
-  skerry trust --list                 list trusted repositories
-  skerry claude install [--yes] [--force] [--settings FILE]
+  skerry enable [DIR] [--yes]         use skerry for checkouts under DIR
+  skerry disable [DIR]                stop using skerry under DIR
+  skerry enable --list                list enabled folders
+  skerry claude install [--enable DIR]... [--yes] [--force] [--settings FILE]
   skerry claude uninstall [--yes] [--settings FILE]
   skerry version
 
@@ -99,14 +99,14 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdList(m, rest, env)
 	case "rm", "remove":
 		return cmdRemove(ctx, m, rest, env)
-	case "trust":
-		return cmdTrust(ctx, m, rest, env)
-	case "untrust":
-		return cmdUntrust(ctx, m, rest, env)
+	case "enable":
+		return cmdEnable(ctx, m, rest, env)
+	case "disable":
+		return cmdDisable(ctx, m, rest, env)
 	case "hook":
 		return cmdHook(ctx, m, rest, env)
 	case "claude":
-		return cmdClaude(rest, env)
+		return cmdClaude(ctx, m, rest, env)
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
@@ -122,8 +122,10 @@ func newManager(env Env) (*workspace.Manager, error) {
 	}
 	return &workspace.Manager{
 		Registry:     registry.Open(dirs.State),
-		Trust:        trust.Open(dirs.State),
+		Scope:        scope.Open(dirs.State),
 		BranchPrefix: env.Getenv("SKERRY_BRANCH_PREFIX"),
+		BaseFromHead: env.Getenv("SKERRY_BASE") == "head",
+		GitHooks:     env.Getenv("SKERRY_GIT_HOOKS") == "1",
 	}, nil
 }
 
@@ -165,8 +167,8 @@ func cmdCreate(ctx context.Context, m *workspace.Manager, args []string, env Env
 		return err
 	}
 	fmt.Fprintln(env.Stdout, ws.Path)
-	if trusted, err := m.Trust.IsTrusted(ws.Repo); err == nil && !trusted {
-		fmt.Fprintf(env.Stderr, "note: %s is not trusted, so skerry will not run its commands. To allow it: skerry trust %s\n", ws.Repo, ws.Repo)
+	if ws.Mode == registry.ModePlain {
+		fmt.Fprintf(env.Stderr, "note: skerry is not enabled for %s, so this is a plain worktree. To enable it: skerry enable %s\n", ws.Repo, ws.Repo)
 	}
 	return nil
 }
@@ -184,9 +186,9 @@ func cmdList(m *workspace.Manager, args []string, env Env) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tBRANCH\tREPOSITORY\tCREATED BY\tAGE")
+	fmt.Fprintln(tw, "NAME\tMODE\tBRANCH\tREPOSITORY\tCREATED BY\tAGE")
 	for _, ws := range all {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Branch, ws.Repo, ws.CreatedBy, age(time.Since(ws.CreatedAt)))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Mode, ws.Branch, ws.Repo, ws.CreatedBy, age(time.Since(ws.CreatedAt)))
 	}
 	return tw.Flush()
 }
@@ -245,86 +247,108 @@ func findByName(ctx context.Context, m *workspace.Manager, name string, env Env)
 	return ws, err
 }
 
-func repoRoot(ctx context.Context, m *workspace.Manager, pos []string, env Env) (string, error) {
-	dir := ""
+// targetDir is the folder an enable/disable command acts on: the given
+// directory, or else the repository containing the current directory, or
+// else the current directory.
+func targetDir(ctx context.Context, m *workspace.Manager, pos []string, env Env) (string, error) {
 	switch len(pos) {
 	case 0:
 		wd, err := env.Getwd()
 		if err != nil {
 			return "", err
 		}
-		dir = wd
+		if root, err := m.Git.MainRoot(ctx, wd); err == nil {
+			return workspace.Canonical(root)
+		}
+		return workspace.Canonical(wd)
 	case 1:
-		dir = pos[0]
+		dir, err := workspace.Canonical(pos[0])
+		if err != nil {
+			return "", err
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			return "", fmt.Errorf("%s is not a directory", dir)
+		}
+		return dir, nil
 	default:
 		return "", fmt.Errorf("%w: expected at most one directory", errUsage)
 	}
-	dir, err := workspace.Canonical(dir)
-	if err != nil {
-		return "", err
-	}
-	root, err := m.Git.MainRoot(ctx, dir)
-	if err != nil {
-		return "", err
-	}
-	return workspace.Canonical(root)
 }
 
-func cmdTrust(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
-	fs := flag.NewFlagSet("trust", flag.ContinueOnError)
+const enableWarning = `Enabling %s means every checkout Claude Code (or skerry create) makes under it
+becomes a skerry workspace, and skerry will run those projects' setup, migration
+and service commands inside each workspace's VM. Only enable folders whose
+projects you trust.
+`
+
+func cmdEnable(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("enable", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "don't ask for confirmation")
-	list := fs.Bool("list", false, "list trusted repositories")
+	list := fs.Bool("list", false, "list enabled folders")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
 	if *list {
-		entries, err := m.Trust.List()
+		entries, err := m.Scope.List()
 		if err != nil {
 			return err
 		}
 		if len(entries) == 0 {
-			fmt.Fprintln(env.Stdout, "no trusted repositories")
+			fmt.Fprintln(env.Stdout, "skerry is not enabled anywhere")
 		}
 		for _, e := range entries {
-			fmt.Fprintf(env.Stdout, "%s\t(since %s)\n", e.Root, e.TrustedAt.Local().Format("2006-01-02"))
+			fmt.Fprintf(env.Stdout, "%s\t(since %s)\n", e.Dir, e.EnabledAt.Local().Format("2006-01-02"))
 		}
 		return nil
 	}
-	root, err := repoRoot(ctx, m, pos, env)
+	dir, err := targetDir(ctx, m, pos, env)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(env.Stderr, "Trusting %s lets skerry run this repository's code: its git hooks when creating\n"+
-		"workspaces now, and its setup, migration and service commands inside workspace VMs later.\n"+
-		"Only trust repositories whose contents you trust.\n", root)
-	if err := confirm(env, *yes, "Trust "+root+"?"); err != nil {
+	return enable(m, dir, *yes, env)
+}
+
+func enable(m *workspace.Manager, dir string, yes bool, env Env) error {
+	if covering, err := m.Scope.Covering(dir); err != nil {
+		return err
+	} else if covering != "" {
+		fmt.Fprintf(env.Stdout, "%s is already enabled (through %s)\n", dir, covering)
+		return nil
+	}
+	fmt.Fprintf(env.Stderr, enableWarning, dir)
+	if err := confirm(env, yes, "Enable skerry for "+dir+"?"); err != nil {
 		return err
 	}
-	if err := m.Trust.Trust(root); err != nil {
+	if err := m.Scope.Enable(dir); err != nil {
 		return err
 	}
-	fmt.Fprintf(env.Stdout, "trusted %s\n", root)
+	fmt.Fprintf(env.Stdout, "enabled %s\n", dir)
 	return nil
 }
 
-func cmdUntrust(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
-	pos, err := parse(flag.NewFlagSet("untrust", flag.ContinueOnError), args)
+func cmdDisable(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	pos, err := parse(flag.NewFlagSet("disable", flag.ContinueOnError), args)
 	if err != nil {
 		return err
 	}
-	root, err := repoRoot(ctx, m, pos, env)
+	dir, err := targetDir(ctx, m, pos, env)
 	if err != nil {
 		return err
 	}
-	removed, err := m.Trust.Untrust(root)
+	removed, err := m.Scope.Disable(dir)
 	if err != nil {
 		return err
 	}
-	if removed {
-		fmt.Fprintf(env.Stdout, "no longer trusting %s\n", root)
-	} else {
-		fmt.Fprintf(env.Stdout, "%s was not trusted\n", root)
+	switch covering, err := m.Scope.Covering(dir); {
+	case err != nil:
+		return err
+	case covering != "":
+		fmt.Fprintf(env.Stdout, "%s is still enabled through %s; run: skerry disable %s\n", dir, covering, covering)
+	case removed:
+		fmt.Fprintf(env.Stdout, "disabled %s; existing workspaces keep running until removed\n", dir)
+	default:
+		fmt.Fprintf(env.Stdout, "%s was not enabled\n", dir)
 	}
 	return nil
 }
@@ -337,7 +361,13 @@ func cmdHook(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 	return h.Run(ctx, args[0], env.Stdin)
 }
 
-func cmdClaude(args []string, env Env) error {
+// dirList collects a repeatable flag.
+type dirList []string
+
+func (d *dirList) String() string     { return strings.Join(*d, ",") }
+func (d *dirList) Set(v string) error { *d = append(*d, v); return nil }
+
+func cmdClaude(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
 	if len(args) == 0 || (args[0] != "install" && args[0] != "uninstall") {
 		return fmt.Errorf("%w: claude takes install or uninstall", errUsage)
 	}
@@ -346,6 +376,8 @@ func cmdClaude(args []string, env Env) error {
 	yes := fs.Bool("yes", false, "don't ask for confirmation")
 	force := fs.Bool("force", false, "replace other tools' worktree hooks")
 	settings := fs.String("settings", "", "settings file (default ~/.claude/settings.json)")
+	var enableDirs dirList
+	fs.Var(&enableDirs, "enable", "enable skerry for this folder (repeatable)")
 	if pos, err := parse(fs, args[1:]); err != nil {
 		return err
 	} else if len(pos) > 0 {
@@ -375,6 +407,9 @@ func cmdClaude(args []string, env Env) error {
 	}
 	if string(next) == string(current) {
 		fmt.Fprintf(env.Stdout, "%s is already up to date\n", path)
+		if install {
+			return enableAfterInstall(m, enableDirs, *yes, env)
+		}
 		return nil
 	}
 
@@ -400,7 +435,51 @@ func cmdClaude(args []string, env Env) error {
 	} else {
 		fmt.Fprintf(env.Stdout, "created %s\n", path)
 	}
+	if install {
+		return enableAfterInstall(m, enableDirs, *yes, env)
+	}
 	return nil
+}
+
+// enableAfterInstall enables the folders named with --enable, or asks which
+// folders to enable. skerry is opt-in: with no answer, nothing changes for
+// Claude Code worktrees until the user runs skerry enable.
+func enableAfterInstall(m *workspace.Manager, dirs []string, yes bool, env Env) error {
+	if len(dirs) == 0 && env.Interactive {
+		fmt.Fprint(env.Stderr, "\nskerry only takes over checkouts in folders you enable; elsewhere worktrees\n"+
+			"stay plain git worktrees, as before. Which folders should use skerry?\n"+
+			"Enter paths separated by commas, or leave empty to decide later: ")
+		answer, _ := bufio.NewReader(env.Stdin).ReadString('\n')
+		for _, d := range strings.Split(answer, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				dirs = append(dirs, expandHome(d))
+			}
+		}
+		yes = true // typing the folder is the confirmation
+	}
+	if len(dirs) == 0 {
+		fmt.Fprintln(env.Stdout, "skerry is not enabled for any folder yet; worktrees stay plain until you run: skerry enable DIR")
+		return nil
+	}
+	for _, d := range dirs {
+		dir, err := workspace.Canonical(d)
+		if err != nil {
+			return err
+		}
+		if err := enable(m, dir, yes, env); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func expandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
 }
 
 // hookExecutable is the skerry path written into Claude's settings. It keeps

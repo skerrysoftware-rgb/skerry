@@ -31,10 +31,19 @@ type Workspace struct {
 	Branch string `json:"branch"`
 	// Base is the commit the branch started from.
 	Base string `json:"base"`
+	// Mode is ModeSkerry for a full environment, or ModePlain for a plain
+	// worktree created where skerry isn't enabled.
+	Mode string `json:"mode"`
 	// CreatedBy says what asked for the workspace, e.g. "cli" or "claude".
 	CreatedBy string    `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// Workspace modes.
+const (
+	ModeSkerry = "skerry"
+	ModePlain  = "plain"
+)
 
 // ErrNotFound is returned when no workspace matches.
 var ErrNotFound = errors.New("workspace not found")

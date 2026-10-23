@@ -66,19 +66,64 @@ Neither session had to know about skerry: it typed `node`, as usual.
 
 ## How it works
 
+Each workspace is a git worktree on your Mac plus its own small Linux VM.
+All VMs boot from one shared, read-only system image, and each sees its
+checkout at the same path as on your Mac:
+
+```mermaid
+flowchart TB
+    claude["<b>Claude Code</b><br/>sessions in worktrees:<br/>CLI, desktop app, subagents"]
+    skerry["<b>skerry</b><br/>creates worktrees, boots VMs,<br/>routes node / npm / yarn into them"]
+    claude -- "worktree and session hooks" --> skerry
+
+    subgraph wsA["workspace demo-a"]
+        direction TB
+        wtA["git worktree on your Mac<br/>.claude/worktrees/demo-a"]
+        subgraph vmA["its own Linux VM"]
+            appA["node server.js on :3000"]
+        end
+        wtA -- "mounted at the same path" --> vmA
+    end
+
+    subgraph wsB["workspace demo-b"]
+        direction TB
+        wtB["git worktree on your Mac<br/>.claude/worktrees/demo-b"]
+        subgraph vmB["its own Linux VM"]
+            appB["node server.js on :3000"]
+        end
+        wtB -- "mounted at the same path" --> vmB
+    end
+
+    skerry --> wsA
+    skerry --> wsB
+    image[("<b>one shared system image</b><br/>Alpine Linux, signature-verified,<br/>read-only to every VM")]
+    vmA -.- image
+    vmB -.- image
 ```
- your Mac                                         one VM per workspace
-┌──────────────────────────────────────┐         ┌───────────────────────────────┐
-│ Claude Code ──hooks──► skerry        │         │ skerry-agent (PID 1)          │
-│   Bash: node/yarn ──► shims ──┐      │         │   SSH server on vsock         │
-│                               ▼      │  vsock  │   runs your commands          │
-│ skerry vm run  (one per workspace) ◄─┼─────────┤                               │
-│   Apple Virtualization framework     │ virtio- │ /Users/…/worktrees/demo-a     │
-│                                      │   fs    │   = your checkout, same path  │
-│ worktree on disk ────────────────────┼─────────┤ / = shared read-only image    │
-│ image cache (verified Alpine)  ──────┼─────────┤   + in-memory overlay         │
-└──────────────────────────────────────┘         └───────────────────────────────┘
+
+When Claude Code starts a session in a worktree and runs a command, this is
+what happens:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Claude Code
+    participant K as skerry
+    participant V as Workspace VM
+
+    C->>K: WorktreeCreate hook: "make worktree demo-a"
+    K-->>C: path of the new worktree (on its own branch)
+    C->>K: SessionStart hook
+    K-->>C: workspace context, and node/npm/yarn shims first on PATH
+    K-)V: boot in the background (about 0.5 s)
+    Note over C: Claude runs `node server.js`
+    C->>K: the `node` shim is skerry
+    K->>V: run `node server.js` in the same directory (SSH over vsock)
+    V-->>K: output and exit code, streamed
+    K-->>C: output and exit code, as if it ran locally
 ```
+
+In more detail:
 
 1. **Workspaces.** `skerry create` (or Claude Code, through skerry's
    `WorktreeCreate` hook) makes a git worktree under `.claude/worktrees/` on
@@ -158,6 +203,14 @@ bin/skerry rm try-it
 ```
 
 ## Use it with Claude Code
+
+Claude Code can run a session in its own git worktree: a separate checkout of
+the repository, on its own branch, so several sessions can work on different
+tasks without overwriting each other's files. From the terminal that is
+`claude --worktree <name>` (the worktree lands in `.claude/worktrees/<name>`);
+in the desktop app, turn on **Worktree** when starting a session. skerry
+hooks into exactly that moment: in an enabled folder, the worktree also gets
+its own VM, so sessions stop colliding on ports, processes and databases too.
 
 ```bash
 bin/skerry claude install

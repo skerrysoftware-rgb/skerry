@@ -1,0 +1,15 @@
+{
+  "name": "orders",
+  "private": true,
+  "scripts": {
+    "migrate": "node migrate.js",
+    "order": "node order.js"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.13.0",
+    "@temporalio/client": "^1.13.0",
+    "@temporalio/worker": "^1.13.0",
+    "@temporalio/workflow": "^1.13.0",
+    "pg": "^8.16.0"
+  }
+}

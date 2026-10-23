@@ -86,7 +86,7 @@ commands run inside it.
 ## 5. Architecture
 
 ```
- host (macOS / Linux)                                    guest (Alpine microVM, one per workspace)
+ host (macOS / Linux)                                    guest (Wolfi microVM, one per workspace)
 ┌───────────────────────────────────────────────┐       ┌─────────────────────────────────────────┐
 │ Claude Code ── hooks ──► skerry (CLI)         │       │ skerry-agent (PID 1)                    │
 │   Bash tool ── shims ──►   │                  │       │   ├─ mounts: /work (checkout, virtiofs) │
@@ -137,13 +137,16 @@ The driver interface: `Create`, `Start`, `Stop`, `Save`, `Restore`, `Destroy`,
 
 ### 6.3 Guest image and agent
 
-- **Base rootfs:** Alpine (musl) built on the host from Alpine's signed
-  packages. The host resolves dependencies from the signed `APKINDEX`, then
-  downloads and verifies each package through Alpine's chain: the release
-  GPG key, then the package-signing keys, the index signature, the
-  control-section hash and the data hash. Nothing unverified enters an image.
-  The native Node dependencies of a large real-world TypeScript monorepo all
-  ship musl builds (checked in its lockfile).
+- **Base rootfs:** Wolfi (glibc), built on the host from Wolfi's signed
+  repository. The host resolves dependencies from the signed `APKINDEX`
+  (choosing among providers as apk does: a package already chosen, then the
+  highest provided version, then provider priority), then downloads each
+  package and checks it against the index: the pinned signing key, the index
+  signature, the control-section hash and the data hash. Wolfi packages carry
+  no signature of their own, so the signed index is what pins them; Alpine
+  packages are also checked against their own signature. Nothing unverified
+  enters an image. Wolfi replaced Alpine (musl) because some native Node
+  modules, such as Temporal's core bridge, ship no musl builds.
 - **Kernel:** Alpine `linux-virt`, verified the same way and unpacked from its
   EFI zboot wrapper. VZ needs an uncompressed arm64 `Image`. The virtio
   drivers are modules, loaded by the agent.
@@ -179,49 +182,64 @@ Cloud Hypervisor 50.1).
 
 ### 6.5 Networking
 
-Each workspace gets its own user-mode network stack (gvisor-tap-vsock,
-Apache-2.0) in its `skerry vm` process. No root, no shared bridge.
+Each workspace gets its own user-mode network stack in its runner process:
+gVisor's netstack (Apache-2.0), driven directly by skerry. No root, no shared
+bridge. The VM's virtio-net card is attached to a datagram socket pair
+(`VZFileHandleNetworkDeviceAttachment`); the other end feeds the stack. The
+stack is the gateway (`192.168.127.1`) for a guest at `192.168.127.2/24`.
 
-Default policy, enforced at connect time after DNS resolution (so DNS
-rebinding cannot bypass it):
+Every TCP connection and UDP flow the guest opens is terminated by the stack
+and re-originated by skerry, after a policy check on the destination address
+(after DNS resolution, so DNS rebinding cannot bypass it):
 
 | Destination | Default |
 |---|---|
 | Public internet | Allowed (package registries, APIs) |
-| The host, including the host's `localhost` | **Denied** |
+| The host: loopback, and every address of its interfaces (checked per connection, so VPNs count) | **Denied** |
 | Other workspaces | **Denied** (separate stacks; no route exists) |
-| Private ranges (RFC 1918, CGNAT, ULA, link-local) | **Denied** |
+| Private ranges (RFC 1918, CGNAT, ULA, link-local), multicast, reserved | **Denied** |
 | Cloud metadata (169.254.169.254, fd00:ec2::254) | **Denied** |
+| The gateway itself, except DNS on port 53 | **Denied** |
+
+DNS queries to the gateway are answered through the host's resolver, so
+corporate and VPN DNS keep working. Only IPv4 is enabled in the guest
+stack.
 
 Inbound traffic arrives only through host-side forwards bound to `127.0.0.1`,
-never `0.0.0.0`:
-
-- HTTP services: `http://<service>.<workspace>.localhost:<proxy-port>`.
-  Browsers and curl resolve `*.localhost` to loopback without DNS changes.
-- TCP services such as Postgres: an allocated loopback port per service,
-  exported to host-side tools.
+never `0.0.0.0`: each service port with authentication, and each port a
+project lists, gets a loopback port chosen once per workspace and reused
+while it is free. A forwarded connection travels over the agent's pinned
+SSH connection (a `direct-tcpip` channel, limited to the guest's loopback
+interface), so services listen only on the guest's loopback, and dev
+servers that bind `localhost` are reachable too.
+(`http://<service>.<workspace>.localhost` names are planned.)
 
 The VZ NAT attachment is not used, because it gives the guest a route to the
 host.
 
 ### 6.6 Services and presets
 
-A preset defines packages, a start command, a readiness check, data
-directories and outputs (`url`, `host`, `port`). The first release ships:
+A preset defines packages, ports, the unprivileged user a service runs as,
+its setup and readiness check, and the environment commands get. Presets
+are code in skerry; a repository can only name them. The first release
+ships:
 
-- `postgres@17`: Alpine `postgresql17` and contrib, plus **pgvector built for
-  17** by skerry's image builder (Alpine's pgvector package targets
-  Postgres 18 only).
-- `redis@8`, or `valkey`.
-- `temporal-dev`: the Temporal CLI dev server, a static binary from its
-  GitHub releases (MIT), pinned by checksum.
-- `node@<major>`: Node from Alpine (`nodejs` 24, `nodejs-current` 26), with
-  corepack for the repository's `packageManager`.
+- `postgres`: Wolfi `postgresql-17` and client, with `pgvector-17`. First
+  boot runs `initdb` (scram passwords for TCP, trust on the guest's local
+  socket), creates database `app` and installs `vector` in it.
+- `valkey`: Valkey 8, a Redis-compatible fork under the BSD license, with
+  append-only persistence and a password.
+- `temporal`: the Temporal CLI dev server with its UI, persisting to SQLite
+  on the data disk.
 
-**Lazy start.** Services that listen on a port start on the first connection
-to that port; the supervisor holds the socket. Workers that poll instead of
-listening (for example Temporal workers) start with their dependencies or on
-`skerry up`.
+Each workspace with services gets a data disk: a sparse raw file attached
+over virtio-blk, formatted ext4 by the guest only if it is blank, mounted at
+`/var/lib/skerry`. A supervisor in the agent runs each service, restarts it
+with backoff, marks it ready when it answers, and stops it cleanly (Postgres
+with a fast shutdown) before the VM powers off.
+
+**Lazy start** (start on first connection) is not implemented: services
+start at boot, and `skerry up` waits until they are ready.
 
 ### 6.7 Detection
 
@@ -427,7 +445,7 @@ single bug does not hand over the host.
 | Host network services, LAN, cloud metadata | Guest network access | Default-deny policy enforced after DNS resolution |
 | skerry control | Other local users; malicious web pages | Control only over `0600` Unix sockets; no TCP control port; dashboard read-only with token and Origin/Host checks |
 | The host itself | A malicious repository at checkout | Opt-in enabled folders; repository git hooks and filter drivers off during worktree creation; detectors never execute code; repository commands only run inside the VM; repository config cannot request host access |
-| Supply chain | Tampered packages, images or releases | Signature-verified Alpine packages; checksum-pinned downloads; Go checksum database; signed releases with SBOM and provenance |
+| Supply chain | Tampered packages, images or releases | Signature-verified Wolfi and Alpine packages (pinned keys); checksum-pinned downloads; Go checksum database; signed releases with SBOM and provenance |
 | Seed data | Leaks of copied production-like data | `0700` storage, no publishing, deletion with workspaces, optional scrubbing |
 | Multi-tenant cloud | Cross-tenant access | VM per session; runner bound to one owner; firecracker jailer; no pre-warmed VM holds owner data |
 
@@ -573,8 +591,8 @@ Findings from the review before building, and what changed.
 |---|---|---|
 | M1 Foundation ✅ | CLI, state, registry, opt-in scope, git worktrees, Claude hooks, `skerry claude install` | Claude worktree sessions are created and removed through skerry |
 | M2 VM core ✅ | vz driver, image builder from verified packages, agent, SSH exec over vsock, shims | `node` from Claude sessions runs inside each workspace's own VM; verified with two parallel sessions on the same port (yarn waits for M3 networking) |
-| M3 Network | Per-workspace stack, egress policy, loopback forwards, `*.localhost` proxy | Policy tests pass; Postgres reachable from host tools |
-| M4 Services | Presets (Postgres 17 + pgvector, Redis, Temporal, Node), supervisor, lazy start, readiness | `skerry wait postgres` works; services start on connect |
+| M3 Network ✅ | Per-workspace stack, egress policy, loopback forwards (`*.localhost` proxy later) | Policy tests pass; probes from a real VM refused for the host, LAN, gateway and metadata; Postgres reachable from host tools |
+| M4 Services ✅ | Presets (Postgres 17 + pgvector, Valkey, Temporal), data disk, supervisor, readiness (lazy start later) | Two workspaces on two branches run their own migrations and Temporal workflows side by side; data survives restarts |
 | M5 Detection | Detectors, plan cache, `skerry.yaml`, profiles, secrets sources | A real-world monorepo gets a correct plan with no config beyond overrides |
 | M6 Seed | Snapshot builder, clone, migrate, drift handling | A workspace has a seeded database with current migrations in seconds after the first snapshot |
 | M7 Experience | Events, `watch`, status line, file-event forwarding, idle stop, memory cap, image cache cleanup, Claude Code plugin packaging | Hot reload works; idle workspaces stop |
@@ -622,8 +640,7 @@ docs/                design, threat model
 1. **Trademark:** USPTO search on "skerry" before any public release.
 2. **Default RAM cap:** 3 GiB per workspace is a guess until a large
    full-stack workspace is measured under load.
-3. **gvisor-tap-vsock egress filtering:** whether its forwarder can enforce
-   the policy directly, or skerry needs its own forwarder on the same netstack
-   (M3).
-4. **pgvector build:** in a builder VM at image-build time (needs
-   `build-base` and `postgresql17-dev`), cached by version.
+3. ~~gvisor-tap-vsock egress filtering~~: resolved by driving gVisor's
+   netstack directly with skerry's own forwarders (M3).
+4. ~~pgvector build~~: resolved by moving to Wolfi, which packages
+   `pgvector-17`.

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 )
 
 // Keys are one workspace's SSH keys, as the host holds them.
@@ -29,6 +31,12 @@ const clientKeyFile = "client_key"
 func EnsureKeys(stateDir, shareDir string) (Keys, error) {
 	clientPath := filepath.Join(stateDir, clientKeyFile)
 	hostPath := filepath.Join(shareDir, HostKeyFile)
+	// Several commands can start a workspace at once; only one may generate.
+	unlock, err := fsutil.Lock(filepath.Join(stateDir, "keys.lock"))
+	if err != nil {
+		return Keys{}, err
+	}
+	defer unlock()
 	if _, err := os.Stat(clientPath); errors.Is(err, os.ErrNotExist) {
 		if err := generateKeys(clientPath, hostPath, filepath.Join(shareDir, AuthorizedKeyFile)); err != nil {
 			return Keys{}, err
@@ -61,7 +69,7 @@ func generateKeys(clientPath, hostPath, authorizedPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(authorizedPath, ssh.MarshalAuthorizedKey(pub), 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(authorizedPath, ssh.MarshalAuthorizedKey(pub), 0o600); err != nil {
 		return err
 	}
 	// Written last: its presence means the set is complete.
@@ -73,7 +81,7 @@ func writePrivate(path string, key ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, pem.EncodeToMemory(block), 0o600)
+	return fsutil.WriteFileAtomic(path, pem.EncodeToMemory(block), 0o600)
 }
 
 func loadSigner(path string) (ssh.Signer, error) {

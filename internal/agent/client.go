@@ -91,7 +91,16 @@ func (c *Client) Run(ctx context.Context, cmd Cmd) (int, error) {
 			return 0, err
 		}
 	}
-	sess.Stdin, sess.Stdout, sess.Stderr = cmd.Stdin, cmd.Stdout, cmd.Stderr
+	sess.Stdout, sess.Stderr = cmd.Stdout, cmd.Stderr
+	// The session's own stdin copy is waited for by Wait, which would hang
+	// on a terminal that never sends end-of-input. Copy it ourselves and
+	// let the copy go when the command exits.
+	var stdin io.WriteCloser
+	if cmd.Stdin != nil {
+		if stdin, err = sess.StdinPipe(); err != nil {
+			return 0, err
+		}
+	}
 
 	quoted := make([]string, len(cmd.Args))
 	for i, a := range cmd.Args {
@@ -99,6 +108,12 @@ func (c *Client) Run(ctx context.Context, cmd Cmd) (int, error) {
 	}
 	if err := sess.Start("exec " + strings.Join(quoted, " ")); err != nil {
 		return 0, err
+	}
+	if stdin != nil {
+		go func() {
+			_, _ = io.Copy(stdin, cmd.Stdin)
+			_ = stdin.Close()
+		}()
 	}
 
 	waited := make(chan error, 1)

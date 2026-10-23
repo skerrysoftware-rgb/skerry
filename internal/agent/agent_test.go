@@ -3,12 +3,16 @@ package agent
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // connTo serves srv on a local socket and returns a connection to it.
@@ -232,6 +236,64 @@ func TestConfigValidate(t *testing.T) {
 	} {
 		if err := tc.cfg.Validate(); (err == nil) != tc.ok {
 			t.Errorf("%+v: err=%v want ok=%v", tc.cfg, err, tc.ok)
+		}
+	}
+}
+
+// A terminal never sends end-of-input; a command that doesn't read stdin
+// must still return as soon as it exits.
+func TestOpenStdinDoesNotHang(t *testing.T) {
+	c, _ := pair(t)
+	r, w := io.Pipe()
+	defer w.Close()
+	done := make(chan struct{})
+	var code int
+	var err error
+	go func() {
+		code, err = c.Run(context.Background(), Cmd{Args: []string{"echo", "hi"}, Stdin: r, Stdout: io.Discard})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run hung waiting for stdin to close")
+	}
+	if err != nil || code != 0 {
+		t.Fatalf("Run = %d, %v; want 0", code, err)
+	}
+}
+
+// A background child that keeps stdout open must not turn success into 255.
+func TestBackgroundChildKeepsExitCode(t *testing.T) {
+	c, _ := pair(t)
+	code, err := c.Run(context.Background(), Cmd{Args: []string{"sh", "-c", "sleep 30 & echo started"}, Stdout: io.Discard})
+	if err != nil || code != 0 {
+		t.Fatalf("Run = %d, %v; want 0", code, err)
+	}
+}
+
+func TestConcurrentEnsureKeysAgree(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		state, share := t.TempDir(), t.TempDir()
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := EnsureKeys(state, share); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+		keys, err := EnsureKeys(state, share)
+		if err != nil {
+			t.Fatal(err)
+		}
+		authorized, _ := os.ReadFile(filepath.Join(share, AuthorizedKeyFile))
+		pub, _, _, _, err := ssh.ParseAuthorizedKey(authorized)
+		if err != nil || !bytes.Equal(pub.Marshal(), keys.Client.PublicKey().Marshal()) {
+			t.Fatalf("round %d: authorized key does not match the client key", round)
 		}
 	}
 }

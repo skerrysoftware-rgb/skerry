@@ -164,7 +164,7 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			mu.Unlock()
 			go func() {
 				err := cmd.Wait()
-				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{exitStatus(err)}))
+				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{exitStatus(cmd, err)}))
 				_ = ch.CloseWrite()
 				close(done)
 				_ = ch.Close()
@@ -234,28 +234,44 @@ func (s *Server) start(command string, clientEnv map[string]string, ch ssh.Chann
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	cmd.Stdin = ch
+	// Stdin is copied by a goroutine Wait doesn't track: a client whose
+	// stdin never ends (a terminal) must not hold up the exit.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
 	cmd.Stdout = ch
 	cmd.Stderr = ch.Stderr()
 	// Its own process group, so signals and cleanup reach its children.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A background child holding stdout open delays the result this long.
 	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	go func() {
+		_, _ = io.Copy(stdin, ch)
+		_ = stdin.Close()
+	}()
 	return cmd, nil
 }
 
-func exitStatus(err error) uint32 {
-	if err == nil {
-		return 0
+// exitStatus is the command's own status. It reads the process state, not
+// Wait's error, so an I/O timeout from a lingering background child doesn't
+// replace the real exit code.
+func exitStatus(cmd *exec.Cmd, err error) uint32 {
+	ps := cmd.ProcessState
+	if ps == nil {
+		return 255
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			return 128 + uint32(ws.Signal())
-		}
-		return uint32(exitErr.ExitCode())
+	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + uint32(ws.Signal())
 	}
-	return 255
+	if code := ps.ExitCode(); code >= 0 {
+		return uint32(code)
+	}
+	if err != nil {
+		return 255
+	}
+	return 0
 }

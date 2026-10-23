@@ -1,13 +1,30 @@
 # skerry
 
-**Every checkout gets its own lightweight Linux VM, so parallel work never
-collides.**
+**An isolated, lightweight Linux VM for every checkout: parallel work that
+can't collide, and code that can't reach your Mac.**
 
 skerry is for developers who work on several branches at once, and for coding
-agents like Claude Code that run many sessions side by side. Each checkout
-(a git worktree) gets a small, fast VM with its own processes, ports and
-filesystem, and soon its own databases and services. Two branches can run the
-same app on the same port at the same time, and neither notices the other.
+agents like Claude Code that run many sessions side by side. It does two
+things:
+
+- **Parallel work without collisions.** Each checkout (a git worktree) gets
+  its own small, fast VM with its own processes, ports and filesystem, and
+  soon its own databases and services. Two branches can run the same app on
+  the same port at the same time, and neither notices the other.
+- **Isolation you can rely on.** Everything a workspace runs (dependency
+  install scripts, repository scripts, commands an AI agent decides to run)
+  runs inside the VM, not on your Mac. Code in a workspace:
+  - can't read files on your Mac outside its own checkout
+  - has no route to your Mac or to other workspaces
+  - can't modify the system image it runs from (shared read-only)
+  - can't redirect your git through the checkout: the worktree's `.git`
+    pointer is locked, and planted repositories or Claude Code settings are
+    quarantined after every command and every 15 seconds
+
+  Each of these was tested by attacking a real VM from the inside. Creating a
+  worktree also never runs the repository's git filter drivers, or its hooks
+  unless you opt in. What isn't covered yet is listed under
+  [Security](#security).
 
 > **Status: early development, macOS on Apple Silicon.** Workspaces, Claude
 > Code integration and per-workspace VMs work today. Networking, services
@@ -181,24 +198,45 @@ Settings, through environment variables for now:
 
 ## Security
 
-skerry runs untrusted code (repository scripts, dependency installs, agent
-commands), so it is built to contain it:
+Workspaces run untrusted code, so skerry is built to contain it.
 
-- **VM boundary.** Workspace commands run in a VM, not on your Mac. The VM
-  sees only its checkout, the read-only image and its own config.
-- **Opt-in.** Nothing from a repository runs outside folders you enable.
-  When creating worktrees, git never runs the repository's filter drivers,
-  and runs its hooks only if you opt in.
-- **Pinned keys.** Host and agent authenticate each other with per-workspace
-  SSH keys that skerry generates. No trust on first use.
-- **Verified images.** Every package is signature-checked before extraction,
-  and extraction cannot write outside the image directory.
-- **Careful deletion.** skerry only deletes worktrees it created and
-  recorded, and never a branch that holds commits.
-- **Private sockets.** Control sockets live in a directory only you can read.
-  No TCP ports are opened.
+**What protects you**
 
-The threat model and the rules every change is tested against are in
+- **VM boundary.** Each workspace is a Linux VM on Apple's Virtualization
+  framework, which runs it in a separate, sandboxed process. The VM sees only
+  its checkout, the read-only system image and its own config.
+- **No route out.** VMs have no network interface besides loopback today,
+  and no vsock path to your Mac or to each other. When networking arrives it
+  will deny your Mac, your local network and cloud metadata by default.
+- **Locked git metadata.** The worktree's `.git` pointer is made immutable,
+  and skerry's own git commands name the repository explicitly, so a VM
+  can't redirect them. After every command, at session start and every
+  15 seconds while a VM runs, skerry scans the checkout for planted
+  repositories and Claude Code settings and quarantines them.
+- **Opt-in.** Nothing happens outside folders you enable. Creating a
+  worktree never runs the repository's filter drivers, or its hooks unless
+  you opt in.
+- **Pinned keys.** Host and VM authenticate each other with per-workspace SSH
+  keys that skerry generates. Nothing is trusted on first use.
+- **Verified images.** Every package is signature-checked from Alpine's
+  signing keys down to each file, and extraction can't write outside the
+  image directory.
+- **Careful deletion and bounded logs.** skerry only deletes worktrees it
+  created, never a branch that holds commits, and caps the logs a VM can
+  write on your disk.
+
+**Known gaps**
+
+- The checkout is shared read-write: that is how your edits reach the VM and
+  its output reaches you. Code in the VM can change your source files, and
+  files git tracks under `.claude/`. Review changes as you would any
+  dependency's.
+- Something running in the background in a VM could plant a file between
+  scans (up to 15 seconds).
+- No disk quota yet: a VM can fill the disk through its checkout.
+- No external security review yet.
+
+The full threat model, and the rules every change is tested against, are in
 [docs/design.md](docs/design.md#7-security).
 
 ## Project layout

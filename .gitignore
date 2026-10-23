@@ -4,3 +4,6 @@
 
 # Throwaway experiments stay local
 /spikes/
+
+# The agent binary is built by make and embedded; never committed
+/internal/assets/files/skerry-agent-*

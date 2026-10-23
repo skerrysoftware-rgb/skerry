@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/scope"
+	"github.com/skerrysoftware-rgb/skerry/internal/shim"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
@@ -48,6 +51,9 @@ Usage:
   skerry create <name> [--from DIR]   create a workspace and print its path
   skerry ls                           list workspaces
   skerry rm <name> [--force]          remove a workspace
+  skerry up [name]                    start a workspace's VM
+  skerry down [name]                  stop it
+  skerry exec [-w name] -- CMD...     run a command inside the workspace VM
   skerry enable [DIR] [--yes]         use skerry for checkouts under DIR
   skerry disable [DIR]                stop using skerry under DIR
   skerry enable --list                list enabled folders
@@ -61,9 +67,12 @@ Claude Code runs "skerry hook <event>" itself; you don't need to.
 // Main runs skerry and returns the process exit code.
 func Main(ctx context.Context, args []string, env Env) int {
 	err := run(ctx, args, env)
+	var code exitCode
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &code):
+		return int(code)
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(env.Stderr, "skerry: %v\n\n%s", err, usage)
 		return 2
@@ -105,6 +114,14 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdDisable(ctx, m, rest, env)
 	case "hook":
 		return cmdHook(ctx, m, rest, env)
+	case "up":
+		return cmdUp(ctx, m, rest, env)
+	case "down":
+		return cmdDown(ctx, m, rest, env)
+	case "exec":
+		return cmdExec(ctx, m, rest, env)
+	case "vm":
+		return cmdVM(ctx, m, rest, env)
 	case "claude":
 		return cmdClaude(ctx, m, rest, env)
 	default:
@@ -241,6 +258,10 @@ func findByName(ctx context.Context, m *workspace.Manager, name string, env Env)
 		}
 	}
 	ws, err := m.Registry.FindByName(repo, name)
+	if errors.Is(err, registry.ErrNotFound) && repo != "" {
+		// Not in this repository; a name unique across all of them still works.
+		ws, err = m.Registry.FindByName("", name)
+	}
 	if errors.Is(err, registry.ErrNotFound) {
 		return ws, fmt.Errorf("no workspace named %q", name)
 	}
@@ -357,7 +378,11 @@ func cmdHook(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 	if len(args) != 1 {
 		return fmt.Errorf("%w: hook takes one event name", errUsage)
 	}
-	h := &hook.Handler{Manager: m, Stdout: env.Stdout, Stderr: env.Stderr, Getenv: env.Getenv}
+	h := &hook.Handler{
+		Manager: m, Stdout: env.Stdout, Stderr: env.Stderr, Getenv: env.Getenv,
+		Shims:   shim.Ensure,
+		StartVM: startInBackground,
+	}
 	return h.Run(ctx, args[0], env.Stdin)
 }
 
@@ -458,7 +483,16 @@ func enableAfterInstall(m *workspace.Manager, dirs []string, yes bool, env Env) 
 		yes = true // typing the folder is the confirmation
 	}
 	if len(dirs) == 0 {
-		fmt.Fprintln(env.Stdout, "skerry is not enabled for any folder yet; worktrees stay plain until you run: skerry enable DIR")
+		enabled, err := m.Scope.List()
+		if err != nil {
+			return err
+		}
+		if len(enabled) == 0 {
+			fmt.Fprintln(env.Stdout, "skerry is not enabled for any folder yet; worktrees stay plain until you run: skerry enable DIR")
+		}
+		for _, e := range enabled {
+			fmt.Fprintf(env.Stdout, "skerry is enabled for %s\n", e.Dir)
+		}
 		return nil
 	}
 	for _, d := range dirs {
@@ -512,4 +546,19 @@ func confirm(env Env, yes bool, question string) error {
 		return nil
 	}
 	return errors.New("cancelled")
+}
+
+// startInBackground boots a workspace's VM without waiting for it, so a hook
+// returns at once and the VM is warm by the time Claude runs a command.
+func startInBackground(ws registry.Workspace) {
+	self, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(self, "up", "--quiet", ws.Name)
+	cmd.Dir = ws.Path
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if cmd.Start() == nil {
+		_ = cmd.Process.Release()
+	}
 }

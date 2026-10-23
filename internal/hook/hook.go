@@ -40,6 +40,10 @@ type Handler struct {
 	Stderr  io.Writer
 	// Getenv reads the environment; tests replace it.
 	Getenv func(string) string
+	// Shims returns the shim directory for skerry workspaces; nil skips it.
+	Shims func() (string, error)
+	// StartVM boots a workspace's VM in the background; nil skips it.
+	StartVM func(registry.Workspace)
 }
 
 // Events maps the skerry subcommand to Claude's event name.
@@ -145,11 +149,30 @@ func (h *Handler) sessionStart(in Input) error {
 	var context string
 	if ws.Mode == registry.ModeSkerry {
 		if envFile := h.getenv("CLAUDE_ENV_FILE"); envFile != "" {
-			if err := appendEnv(envFile, map[string]string{"SKERRY_WORKSPACE": ws.Name}); err != nil {
+			lines := []string{"export SKERRY_WORKSPACE=" + ShellQuote(ws.Name)}
+			if h.Shims != nil {
+				dir, err := h.Shims()
+				if err != nil {
+					return err
+				}
+				// Shims first, so node, npm, yarn... run inside the VM.
+				lines = append(lines, "export PATH="+ShellQuote(dir)+`:"$PATH"`)
+			}
+			if err := appendLines(envFile, lines); err != nil {
 				return err
 			}
 		}
-		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s.", ws.Name, ws.Path, ws.Branch)
+		if h.StartVM != nil {
+			h.StartVM(ws) // boot in the background so the first command is quick
+		}
+		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s."+
+			" The workspace has its own lightweight Linux VM (Alpine), isolated from other workspaces:"+
+			" its own processes, ports and /tmp. The checkout is mounted at the same path inside the VM."+
+			" `node`, `npm`, `npx`, `yarn`, `pnpm` and `corepack` run inside the VM automatically;"+
+			" every other command, git included, runs on the host as usual."+
+			" To run anything else inside the VM, use `skerry exec -- <command>`"+
+			" (for example `skerry exec -- sh -c 'ls /tmp'`). The VM has no network access yet.",
+			ws.Name, ws.Path, ws.Branch)
 	} else {
 		// A plain worktree: say once per repository that skerry is
 		// available, then stay out of the way.
@@ -170,16 +193,16 @@ func (h *Handler) sessionStart(in Input) error {
 	})
 }
 
-// appendEnv adds export lines to Claude's env file, which it sources before
-// every Bash command. Other hooks write to the same file, so only append.
-func appendEnv(path string, vars map[string]string) error {
+// appendLines adds lines to Claude's env file, which it sources before every
+// Bash command. Other hooks write to the same file, so only append.
+func appendLines(path string, lines []string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return fmt.Errorf("open CLAUDE_ENV_FILE: %w", err)
 	}
 	defer f.Close()
-	for name, value := range vars {
-		if _, err := fmt.Fprintf(f, "export %s=%s\n", name, ShellQuote(value)); err != nil {
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(f, line); err != nil {
 			return err
 		}
 	}

@@ -32,7 +32,7 @@ const (
 var Repos = []string{"main", "community"}
 
 // BasePackages are in every rootfs.
-var BasePackages = []string{"alpine-baselayout", "busybox", "busybox-binsh", "musl", "ca-certificates-bundle"}
+var BasePackages = []string{"alpine-baselayout", "alpine-release", "busybox", "busybox-binsh", "musl", "ca-certificates-bundle"}
 
 // BootModules are loaded by the agent at boot, dependencies first.
 var BootModules = []string{"fuse", "virtiofs", "overlay", "vsock", "vmw_vsock_virtio_transport_common", "vmw_vsock_virtio_transport"}
@@ -244,6 +244,8 @@ func (b *Builder) buildBoot(ctx context.Context, dir string, kpkg Package, agent
 	for _, d := range []string{"dev", "proc", "sys", "mnt", "run", "newroot", "lib", "lib/modules"} {
 		c.Dir(d, 0o755)
 	}
+	c.CharDev("dev/console", 0o600, 5, 1)
+	c.CharDev("dev/null", 0o666, 1, 3)
 	c.File("init", 0o755, agent)
 	var order []string
 	for _, m := range modules {

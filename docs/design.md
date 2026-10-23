@@ -513,6 +513,9 @@ The spike code is kept outside this repository.
 | `WorktreeRemove` in headless (`-p`) sessions | **Not fired**; skerry needs its own sweep for leftovers |
 | `SessionStart` in a worktree session | Fires with the worktree as `cwd`; reads hooks from user settings and the worktree's *committed* project settings (verified in M1) |
 | `CLAUDE_ENV_FILE` exports | Visible to Claude's Bash commands (verified in M1) |
+| `skerry exec` in a running workspace | **~50 ms** per command (M2) |
+| First use: download, verify and build the image, run install scripts in a build VM, boot | **~10 s** (M2) |
+| Two Claude sessions in parallel, each running a server on port 3000 | **Both succeed**, each answering for its own workspace; the same two servers on the host fail with `EADDRINUSE` (M2) |
 | Boot: `Start()` to guest ready | **0.42–0.47 s** (kernel to init: 50 ms) |
 | Host memory, idle | **~141 MB** for a 1 GiB guest |
 | Host memory after the guest allocates then frees 500 MiB | **~610 MB, not returned** |
@@ -568,13 +571,13 @@ Findings from the review before building, and what changed.
 
 | Milestone | Contents | Done when |
 |---|---|---|
-| M1 Foundation | CLI, state, registry, opt-in scope, git worktrees, Claude hooks, `skerry claude install` | Claude worktree sessions are created and removed through skerry |
-| M2 VM core | vz driver, image builder from verified packages, agent, SSH exec over vsock, shims | `yarn --version` from a Claude session runs inside the workspace VM |
+| M1 Foundation ✅ | CLI, state, registry, opt-in scope, git worktrees, Claude hooks, `skerry claude install` | Claude worktree sessions are created and removed through skerry |
+| M2 VM core ✅ | vz driver, image builder from verified packages, agent, SSH exec over vsock, shims | `node` from Claude sessions runs inside each workspace's own VM; verified with two parallel sessions on the same port (yarn waits for M3 networking) |
 | M3 Network | Per-workspace stack, egress policy, loopback forwards, `*.localhost` proxy | Policy tests pass; Postgres reachable from host tools |
 | M4 Services | Presets (Postgres 17 + pgvector, Redis, Temporal, Node), supervisor, lazy start, readiness | `skerry wait postgres` works; services start on connect |
 | M5 Detection | Detectors, plan cache, `skerry.yaml`, profiles, secrets sources | A real-world monorepo gets a correct plan with no config beyond overrides |
 | M6 Seed | Snapshot builder, clone, migrate, drift handling | A workspace has a seeded database with current migrations in seconds after the first snapshot |
-| M7 Experience | Events, `watch`, status line, file-event forwarding, idle stop, memory cap | Hot reload works; idle workspaces stop |
+| M7 Experience | Events, `watch`, status line, file-event forwarding, idle stop, memory cap, image cache cleanup, Claude Code plugin packaging | Hot reload works; idle workspaces stop |
 | M8 Hardening | Escape tests, fuzzing, threat-model tests, docs | All invariants have passing tests |
 
 **Release 2:** Linux (cloud-hypervisor, namespaces), CI on KVM.

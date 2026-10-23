@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 	"github.com/skerrysoftware-rgb/skerry/internal/gitx"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/scope"
@@ -49,7 +50,17 @@ type Manager struct {
 	BaseFromHead bool
 	// GitHooks lets the repository's git hooks run during worktree creation.
 	GitHooks bool
-	Now      func() time.Time
+	// VMs stops and forgets workspace VMs on removal; nil in tests.
+	VMs VMs
+	Now func() time.Time
+}
+
+// VMs is what removal needs from the VM layer.
+type VMs interface {
+	// Down stops the workspace's VM, if it is running.
+	Down(registry.Workspace) error
+	// Forget deletes the workspace's VM state: keys, logs, identity.
+	Forget(registry.Workspace) error
 }
 
 // CreateOptions describes a new workspace.
@@ -83,6 +94,14 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 		return registry.Workspace{}, err
 	}
 
+	// One create at a time per repository: parallel subagents and sessions
+	// otherwise race on the worktrees directory and .git/info/exclude.
+	unlock, err := fsutil.Lock(filepath.Join(root, ".git", "skerry.lock"))
+	if err != nil {
+		return registry.Workspace{}, err
+	}
+	defer unlock()
+
 	parent, err := ensureRealDir(root, WorktreesDir)
 	if err != nil {
 		return registry.Workspace{}, err
@@ -92,7 +111,9 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 		if existing, err := m.Registry.FindByPath(path); err == nil && existing.Path == path && info.IsDir() {
 			return existing, nil
 		}
-		return registry.Workspace{}, fmt.Errorf("%s already exists and skerry did not create it", path)
+		// A worktree made before skerry was installed: reopen it, as
+		// Claude Code would, and start tracking it.
+		return m.adopt(ctx, root, path, o)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return registry.Workspace{}, err
 	}
@@ -132,7 +153,9 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	if err := m.Git.AddWorktree(ctx, gitx.AddWorktreeOptions{
 		From: from, Path: path, Branch: branch, Base: base, RunHooks: m.GitHooks,
 	}); err != nil {
-		return registry.Workspace{}, err
+		// git creates the branch before checking out; don't leave it (or a
+		// half-made worktree) blocking this name.
+		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 	// Keep the main checkout's `git status` clean of the worktrees directory.
 	if err := m.Git.ExcludeLocally(ctx, root, WorktreesDir+"/"+o.Name, "/"+WorktreesDir+"/"); err != nil {
@@ -221,15 +244,65 @@ func copyFile(src, dst *os.Root, rel string, perm os.FileMode) error {
 }
 
 // rollback undoes a half-created worktree and returns the original error.
+// Callers hold the repository lock and checked that path and branch were
+// new, so everything removed here is this call's own.
 func (m *Manager) rollback(ctx context.Context, root, path, branch string, cause error) error {
 	errs := []error{cause}
-	if err := m.Git.RemoveWorktree(ctx, root, path, true); err != nil {
-		errs = append(errs, fmt.Errorf("rollback: %w", err))
+	if _, err := os.Lstat(path); err == nil {
+		if err := m.Git.RemoveWorktree(ctx, root, path, true); err != nil {
+			errs = append(errs, fmt.Errorf("rollback: %w", err))
+		}
 	}
-	if err := m.Git.DeleteBranch(ctx, root, branch); err != nil {
-		errs = append(errs, fmt.Errorf("rollback: %w", err))
+	_ = m.Git.PruneWorktrees(ctx, root)
+	if exists, err := m.Git.BranchExists(ctx, root, branch); err == nil && exists {
+		if err := m.Git.DeleteBranch(ctx, root, branch); err != nil {
+			errs = append(errs, fmt.Errorf("rollback: %w", err))
+		}
 	}
 	return errors.Join(errs...)
+}
+
+// adopt registers an existing worktree of this repository that skerry did
+// not create, such as one Claude Code made before skerry was installed.
+func (m *Manager) adopt(ctx context.Context, root, path string, o CreateOptions) (registry.Workspace, error) {
+	// It must be a worktree in its own right, not just a folder that git
+	// finds the main checkout from.
+	top, err := m.Git.TopLevel(ctx, path)
+	if err == nil {
+		top, err = Canonical(top)
+	}
+	owner, ownerErr := m.Git.MainRoot(ctx, path)
+	if ownerErr == nil {
+		owner, ownerErr = Canonical(owner)
+	}
+	if err != nil || ownerErr != nil || top != path || owner != root {
+		return registry.Workspace{}, fmt.Errorf("%s already exists and is not a worktree of %s", path, root)
+	}
+	branch, err := m.Git.CurrentBranch(ctx, path)
+	if err != nil {
+		return registry.Workspace{}, err
+	}
+	head, err := m.Git.Head(ctx, path)
+	if err != nil {
+		return registry.Workspace{}, err
+	}
+	enabled, err := m.Scope.IsEnabled(root)
+	if err != nil {
+		return registry.Workspace{}, err
+	}
+	mode := registry.ModePlain
+	if enabled {
+		mode = registry.ModeSkerry
+	}
+	id, err := newID()
+	if err != nil {
+		return registry.Workspace{}, err
+	}
+	ws := registry.Workspace{
+		ID: id, Name: o.Name, Repo: root, Path: path, Branch: branch, Base: head,
+		Mode: mode, CreatedBy: o.CreatedBy + " (adopted)", CreatedAt: m.now().UTC(),
+	}
+	return ws, m.Registry.Add(ws)
 }
 
 // ErrHasWork means removing a workspace would lose uncommitted changes or
@@ -253,13 +326,19 @@ func (m *Manager) Remove(ctx context.Context, ws registry.Workspace, force bool)
 	}
 
 	_, statErr := os.Lstat(ws.Path)
+	if statErr == nil && !force {
+		if err := m.checkNoWork(ctx, ws); err != nil {
+			return RemoveResult{}, err
+		}
+	}
+	// Stop the VM before its checkout disappears from under it.
+	if m.VMs != nil && ws.Mode == registry.ModeSkerry {
+		if err := m.VMs.Down(ws); err != nil {
+			return RemoveResult{}, fmt.Errorf("stop %s's VM: %w", ws.Name, err)
+		}
+	}
 	switch {
 	case statErr == nil:
-		if !force {
-			if err := m.checkNoWork(ctx, ws); err != nil {
-				return RemoveResult{}, err
-			}
-		}
 		if err := m.Git.RemoveWorktree(ctx, ws.Repo, ws.Path, force); err != nil {
 			return RemoveResult{}, err
 		}
@@ -286,6 +365,11 @@ func (m *Manager) Remove(ctx context.Context, ws registry.Workspace, force bool)
 	}
 	if err := m.Registry.Remove(ws.ID); err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return res, err
+	}
+	if m.VMs != nil {
+		if err := m.VMs.Forget(ws); err != nil {
+			return res, fmt.Errorf("delete %s's VM state: %w", ws.Name, err)
+		}
 	}
 	return res, nil
 }
@@ -339,7 +423,9 @@ func Canonical(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", path, err)
 	}
-	return real, nil
+	// On a case-insensitive disk "~/src/App" and "~/Src/app" are the same
+	// folder; use the name as stored, so lookups agree with git.
+	return fsutil.RealPath(real), nil
 }
 
 // ensureRealDir creates root/rel and makes sure no part of rel is a symlink:
@@ -352,8 +438,12 @@ func ensureRealDir(root, rel string) (string, error) {
 		info, err := os.Lstat(dir)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
-			if err := os.Mkdir(dir, 0o755); err != nil {
+			if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 				return "", err
+			}
+			// Someone may have made it first; check what is there now.
+			if info, err := os.Lstat(dir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("refusing to use %s: not a real directory", dir)
 			}
 		case err != nil:
 			return "", err

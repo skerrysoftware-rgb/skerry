@@ -56,7 +56,7 @@ func resolveWorkspace(ctx context.Context, m *workspace.Manager, pos []string, e
 		}
 		return ws, err
 	case 1:
-		return findByName(ctx, m, pos[0], env)
+		return findByName(ctx, m, pos[0], env, true)
 	default:
 		return registry.Workspace{}, fmt.Errorf("%w: expected at most one workspace name", errUsage)
 	}
@@ -221,16 +221,29 @@ func Shim(ctx context.Context, argv0 string, args []string, env Env) int {
 }
 
 func runShim(ctx context.Context, name string, args []string, env Env) error {
-	if env.Getenv("SKERRY_SHIMS") != "off" {
-		if m, err := newManager(env); err == nil {
-			if wd, err := env.Getwd(); err == nil {
-				if ws, err := m.Find(wd); err == nil && ws.Mode == registry.ModeSkerry {
-					return runInWorkspace(ctx, ws, append([]string{name}, args...), env)
-				}
-			}
-		}
+	if env.Getenv("SKERRY_SHIMS") == "off" {
+		return execReal(name, args)
 	}
-	return execReal(name, args)
+	wd, err := env.Getwd()
+	if err != nil {
+		return execReal(name, args) // no current directory: not in a workspace
+	}
+	m, err := newManager(env)
+	if err != nil {
+		// Fail closed: running repository code on the host by accident is
+		// worse than an error.
+		return fmt.Errorf("can't tell whether %s is a skerry workspace: %w (set SKERRY_SHIMS=off to run %s on this machine)", wd, err, name)
+	}
+	ws, err := m.Find(wd)
+	switch {
+	case errors.Is(err, registry.ErrNotFound), errors.Is(err, os.ErrNotExist):
+		return execReal(name, args)
+	case err != nil:
+		return fmt.Errorf("can't tell whether %s is a skerry workspace: %w (set SKERRY_SHIMS=off to run %s on this machine)", wd, err, name)
+	case ws.Mode != registry.ModeSkerry:
+		return execReal(name, args)
+	}
+	return runInWorkspace(ctx, ws, append([]string{name}, args...), env)
 }
 
 // execReal replaces this process with the next binary called name on PATH,

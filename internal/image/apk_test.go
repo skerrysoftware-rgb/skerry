@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,10 +12,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type tarEntry struct {
@@ -289,3 +293,38 @@ func TestParseIndexRejectsUnsafeNames(t *testing.T) {
 		}
 	}
 }
+
+func TestStaleIndexUsedWhenOffline(t *testing.T) {
+	f := newFixture(t)
+	body := gzTar(t, tarEntry{name: "APKINDEX", body: "P:a\nV:1-r0\nC:Q1x\nS:1\n"})
+	signed := append(f.sign(t, body), body...)
+	dir := t.TempDir()
+	b := &Builder{Dir: dir, Keys: f.keys, Arch: "aarch64",
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("offline")
+		})}}
+	cached := filepath.Join(b.repoDir("main"), "APKINDEX.tar.gz")
+	if err := os.MkdirAll(filepath.Dir(cached), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cached, signed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-72 * time.Hour)
+	os.Chtimes(cached, old, old)
+
+	text, err := b.index(context.Background(), "main")
+	if err != nil || !strings.Contains(text, "P:a") {
+		t.Fatalf("offline with a stale cached index: %q, %v", text, err)
+	}
+	// A cached index that doesn't verify is never used.
+	os.WriteFile(cached, body, 0o644)
+	os.Chtimes(cached, old, old)
+	if _, err := b.index(context.Background(), "main"); err == nil {
+		t.Fatal("used an unsigned cached index")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

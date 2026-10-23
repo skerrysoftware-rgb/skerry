@@ -3,9 +3,11 @@ package workspace_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
@@ -347,5 +349,120 @@ func TestRemoveRefusesPathOutsideWorktreesDir(t *testing.T) {
 	}
 	if _, err := os.Stat(victim); err != nil {
 		t.Fatal("Remove deleted a path outside the worktrees directory")
+	}
+}
+
+func TestConcurrentCreatesInFreshRepo(t *testing.T) {
+	root := testutil.NewRepo(t)
+	m := newManager(t)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := m.Create(context.Background(), workspace.CreateOptions{From: root, Name: fmt.Sprintf("agent-%d", i)})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	exclude, _ := os.ReadFile(filepath.Join(root, ".git", "info", "exclude"))
+	if n := strings.Count(string(exclude), "/.claude/worktrees/"); n != 1 {
+		t.Errorf("exclude has %d worktree entries, want 1:\n%s", n, exclude)
+	}
+}
+
+func TestAdoptsExistingWorktree(t *testing.T) {
+	root := testutil.NewRepo(t)
+	path := filepath.Join(root, ".claude", "worktrees", "old")
+	testutil.Git(t, root, "worktree", "add", "--quiet", "-b", "worktree-old", path)
+	ws, err := newManager(t).Create(context.Background(), workspace.CreateOptions{From: root, Name: "old"})
+	if err != nil {
+		t.Fatalf("reopening a pre-existing worktree: %v", err)
+	}
+	if ws.Path != path || ws.Branch != "worktree-old" {
+		t.Errorf("adopted %+v", ws)
+	}
+}
+
+func TestFailedCreateRollsBackBranch(t *testing.T) {
+	root := testutil.NewRepo(t)
+	m := newManager(t)
+	parent := filepath.Join(root, ".claude", "worktrees")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o555); err != nil { // git can't create the worktree
+		t.Fatal(err)
+	}
+	_, err := m.Create(context.Background(), workspace.CreateOptions{From: root, Name: "blocked"})
+	os.Chmod(parent, 0o755)
+	if err == nil {
+		t.Fatal("create into a read-only directory succeeded")
+	}
+	if out := testutil.Git(t, root, "branch", "--list", "worktree-blocked"); out != "" {
+		t.Fatalf("failed create left branch %q behind", out)
+	}
+	if _, err := m.Create(context.Background(), workspace.CreateOptions{From: root, Name: "blocked"}); err != nil {
+		t.Fatalf("retrying the name after a failure: %v", err)
+	}
+}
+
+type fakeVMs struct{ calls []string }
+
+func (f *fakeVMs) Down(ws registry.Workspace) error {
+	f.calls = append(f.calls, "down:"+ws.Name)
+	if _, err := os.Stat(ws.Path); err != nil {
+		f.calls = append(f.calls, "ERROR worktree already gone at down")
+	}
+	return nil
+}
+
+func (f *fakeVMs) Forget(ws registry.Workspace) error {
+	f.calls = append(f.calls, "forget:"+ws.Name)
+	return nil
+}
+
+func TestRemoveStopsVMFirstAndForgetsIt(t *testing.T) {
+	root := testutil.NewRepo(t)
+	m := newManager(t)
+	vms := &fakeVMs{}
+	m.VMs = vms
+	if err := m.Scope.Enable(root); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := m.Create(context.Background(), workspace.CreateOptions{From: root, Name: "vm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Remove(context.Background(), ws, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(vms.calls, ","); got != "down:vm,forget:vm" {
+		t.Errorf("VM calls = %s, want down before removal, forget after", got)
+	}
+}
+
+func TestCanonicalUsesOnDiskCase(t *testing.T) {
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	real := filepath.Join(dir, "CaseRepo")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "caserepo")); err != nil {
+		t.Skip("case-sensitive filesystem")
+	}
+	got, err := workspace.Canonical(filepath.Join(dir, "caserepo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != real {
+		t.Errorf("Canonical = %s, want %s", got, real)
 	}
 }

@@ -388,6 +388,14 @@ func (b *Builder) index(ctx context.Context, repo string) (string, error) {
 	}
 	data, err := b.download(ctx, b.repoURL(repo)+"/APKINDEX.tar.gz", 64<<20)
 	if err != nil {
+		// Offline: an older index that still verifies is better than not
+		// starting at all. Fresh packages wait for the next refresh.
+		if cachedData, cerr := os.ReadFile(cached); cerr == nil {
+			if text, verr := VerifyIndex(b.Keys, cachedData); verr == nil {
+				b.logf("using the cached %s index (refresh failed: %v)", repo, err)
+				return text, nil
+			}
+		}
 		return "", err
 	}
 	text, err := VerifyIndex(b.Keys, data)

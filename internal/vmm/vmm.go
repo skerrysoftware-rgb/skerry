@@ -1,13 +1,14 @@
 // Package vmm runs one VM per skerry workspace.
 //
-// Each running workspace has a runner process (`skerry vm run`) that owns
-// the VM and exposes the guest agent on a private Unix socket. Commands such
-// as `skerry exec` connect to that socket and speak SSH to the agent.
+// Each running workspace has exactly one runner process (`skerry vm run`)
+// that owns the VM and exposes the guest agent on a private Unix socket.
+// The runner holds a per-workspace lock for its whole life: a second runner
+// exits at once, only the lock holder ever touches the socket, and "is the
+// lock held" is the definition of "is the workspace running".
 package vmm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,10 +34,21 @@ import (
 // Packages every workspace image gets in this release.
 var Packages = []string{"nodejs", "npm"}
 
-// Resources for each workspace VM.
+// Resources and limits for each workspace VM.
 const (
 	CPUs      = 4
 	MemoryMiB = 3072
+	// consoleCap bounds the guest console log (twice this, with rotation).
+	consoleCap = 8 << 20
+	// runnerLogCap bounds the runner's own log.
+	runnerLogCap = 1 << 20
+)
+
+// Timeouts for starting and stopping.
+const (
+	bootTimeout     = 60 * time.Second
+	poweroffGrace   = 10 * time.Second
+	runnerStopGrace = 20 * time.Second
 )
 
 // Manager starts, stops and connects to workspace VMs.
@@ -56,7 +68,7 @@ func (m *Manager) progressf(format string, args ...any) {
 
 // Workspace paths.
 type wsPaths struct {
-	state, share, socket, console, runnerLog, pid, machineID string
+	state, share, socket, lock, console, runnerLog, pid, machineID string
 }
 
 func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
@@ -64,16 +76,22 @@ func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
 	if err != nil {
 		return wsPaths{}, err
 	}
-	state := filepath.Join(m.Dirs.State, "workspaces", ws.ID)
+	state := m.StateDir(ws)
 	return wsPaths{
 		state:     state,
 		share:     filepath.Join(state, "share"),
 		socket:    filepath.Join(sockDir, ws.ID+".sock"),
+		lock:      filepath.Join(state, "runner.lock"),
 		console:   filepath.Join(state, "console.log"),
 		runnerLog: filepath.Join(state, "runner.log"),
 		pid:       filepath.Join(state, "runner.pid"),
 		machineID: filepath.Join(state, "machine-id"),
 	}, nil
+}
+
+// StateDir is where a workspace's keys, logs and VM identity live.
+func (m *Manager) StateDir(ws registry.Workspace) string {
+	return filepath.Join(m.Dirs.State, "workspaces", ws.ID)
 }
 
 // socketDir is a short, private directory for runner sockets. Unix socket
@@ -112,7 +130,8 @@ func (m *Manager) Image(ctx context.Context) (image.Image, error) {
 	if err := os.MkdirAll(filepath.Join(m.Dirs.Cache, "images"), 0o755); err != nil {
 		return image.Image{}, err
 	}
-	img, err := b.Build(ctx, image.Spec{Packages: Packages, Agent: agentBin})
+	spec := image.Spec{Packages: Packages, Agent: agentBin}
+	img, err := b.Build(ctx, spec)
 	if err != nil {
 		return image.Image{}, err
 	}
@@ -125,7 +144,7 @@ func (m *Manager) Image(ctx context.Context) (image.Image, error) {
 		return image.Image{}, err
 	}
 	defer unlock()
-	if img, err = b.Build(ctx, image.Spec{Packages: Packages, Agent: agentBin}); err != nil || img.Finalized {
+	if img, err = b.Build(ctx, spec); err != nil || img.Finalized {
 		return img, err
 	}
 	m.progressf("  running package install scripts in a build VM")
@@ -154,7 +173,7 @@ func (m *Manager) finalize(ctx context.Context, img image.Image) error {
 		return err
 	}
 	logPath := img.Dir + ".finalize.log"
-	log, err := os.Create(logPath)
+	log, err := fsutil.OpenCappedLog(logPath, consoleCap)
 	if err != nil {
 		return err
 	}
@@ -176,7 +195,8 @@ func (m *Manager) finalize(ctx context.Context, img image.Image) error {
 		_ = vm.Stop()
 		return ctx.Err()
 	}
-	if _, err := os.Stat(filepath.Join(img.Rootfs, ".skerry", "finalized")); err != nil {
+	// The guest wrote this marker; accept only a plain file.
+	if info, err := os.Lstat(filepath.Join(img.Rootfs, ".skerry", "finalized")); err != nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("install scripts did not complete; see %s", logPath)
 	}
 	return nil
@@ -195,8 +215,8 @@ func hostname(name string) string {
 	return h
 }
 
-// prepare creates the workspace's state directory, keys and agent config.
-func (m *Manager) prepare(ws registry.Workspace) (wsPaths, agent.Keys, error) {
+// keys loads (or on first use creates) the workspace's state dirs and keys.
+func (m *Manager) keys(ws registry.Workspace) (wsPaths, agent.Keys, error) {
 	p, err := m.paths(ws)
 	if err != nil {
 		return p, agent.Keys{}, err
@@ -207,28 +227,39 @@ func (m *Manager) prepare(ws registry.Workspace) (wsPaths, agent.Keys, error) {
 		}
 	}
 	keys, err := agent.EnsureKeys(p.state, p.share)
-	if err != nil {
-		return p, agent.Keys{}, err
-	}
-	err = agent.WriteConfig(p.share, agent.Config{Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name)})
 	return p, keys, err
 }
 
 // Run is the runner: it boots the workspace VM, serves the agent socket, and
-// returns when the VM stops. Cancelling ctx powers the guest off.
+// returns when the VM stops. Cancelling ctx powers the guest off. A runner
+// started while another holds the workspace exits at once with no error.
 func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	if ws.Mode != registry.ModeSkerry {
 		return fmt.Errorf("%s is a plain worktree; skerry is not enabled for %s", ws.Name, ws.Repo)
 	}
+	p, keys, err := m.keys(ws)
+	if err != nil {
+		return err
+	}
+	unlock, ok, err := fsutil.TryLock(p.lock)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // another runner owns this workspace
+	}
+	defer unlock()
+
 	img, err := m.Image(ctx)
 	if err != nil {
 		return err
 	}
-	p, keys, err := m.prepare(ws)
-	if err != nil {
+	// Written once, before boot, while nothing reads it.
+	cfg := agent.Config{Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name)}
+	if err := agent.WriteConfig(p.share, cfg); err != nil {
 		return err
 	}
-	console, err := os.OpenFile(p.console, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	console, err := fsutil.OpenCappedLog(p.console, consoleCap)
 	if err != nil {
 		return err
 	}
@@ -242,15 +273,18 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	if err != nil {
 		return err
 	}
+	// Only the lock holder gets here, so a socket left at this path is stale.
 	_ = os.Remove(p.socket)
 	l, err := net.Listen("unix", p.socket)
 	if err != nil {
 		_ = vm.Stop()
 		return err
 	}
-	defer os.Remove(p.socket)
-	if err := os.WriteFile(p.pid, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	defer os.Remove(p.socket) // runs before unlock: we still own the path
+	if err := fsutil.WriteFileAtomic(p.pid, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 		_ = vm.Stop()
+		l.Close()
 		return err
 	}
 	defer os.Remove(p.pid)
@@ -272,14 +306,17 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	case <-ctx.Done():
 	}
 	l.Close()
-	// Ask the guest to shut down cleanly; force it after a grace period.
-	if c, err := m.dialAgent(p, keys); err == nil {
-		_ = c.Poweroff()
-		c.Close()
+	// Ask the guest to shut down cleanly, talking to it directly; force it
+	// off if it doesn't (a hostile guest may ignore the request).
+	if conn, err := vm.Dial(agent.Port); err == nil {
+		if c, err := agent.NewClient(conn, keys); err == nil {
+			_ = c.Poweroff()
+			c.Close()
+		}
 	}
 	select {
 	case <-vm.Done():
-	case <-time.After(15 * time.Second):
+	case <-time.After(poweroffGrace):
 		_ = vm.Stop()
 		<-vm.Done()
 	}
@@ -291,7 +328,7 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 func proxy(client net.Conn, vm *engine.VM) {
 	defer client.Close()
 	var guest net.Conn
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(bootTimeout)
 	for {
 		c, err := vm.Dial(agent.Port)
 		if err == nil {
@@ -314,38 +351,37 @@ func proxy(client net.Conn, vm *engine.VM) {
 	<-done
 }
 
-func (m *Manager) dialAgent(p wsPaths, keys agent.Keys) (*agent.Client, error) {
-	conn, err := net.DialTimeout("unix", p.socket, 2*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	return agent.NewClient(conn, keys)
-}
-
-// Connect returns a client for a running workspace.
-func (m *Manager) Connect(ws registry.Workspace) (*agent.Client, error) {
-	p, keys, err := m.prepare(ws)
-	if err != nil {
-		return nil, err
-	}
-	return m.dialAgent(p, keys)
-}
-
-// Running reports whether the workspace's agent answers.
+// Running reports whether the workspace has a runner.
 func (m *Manager) Running(ws registry.Workspace) bool {
 	p, err := m.paths(ws)
 	if err != nil {
 		return false
 	}
-	if _, err := os.Stat(p.socket); err != nil {
+	if _, err := os.Stat(p.lock); err != nil {
 		return false
 	}
-	c, err := m.Connect(ws)
+	unlock, ok, err := fsutil.TryLock(p.lock)
 	if err != nil {
 		return false
 	}
-	defer c.Close()
-	return c.Ping() == nil
+	if ok {
+		unlock()
+		return false
+	}
+	return true
+}
+
+// Connect returns a client for a running workspace.
+func (m *Manager) Connect(ws registry.Workspace) (*agent.Client, error) {
+	p, keys, err := m.keys(ws)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout("unix", p.socket, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return agent.NewClient(conn, keys)
 }
 
 // Up starts the workspace's VM in the background, if it isn't running, and
@@ -360,31 +396,32 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 		}
 		c.Close()
 	}
-	// Build the image in the foreground, so progress and errors are visible.
-	if _, err := m.Image(ctx); err != nil {
-		return nil, err
-	}
-	p, _, err := m.prepare(ws)
+	p, _, err := m.keys(ws)
 	if err != nil {
 		return nil, err
 	}
-	m.progressf("starting workspace %s", ws.Name)
-	logf, err := os.OpenFile(p.runnerLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	runner := exec.Command(m.Self, "vm", "run", ws.ID)
-	runner.Stdout, runner.Stderr = logf, logf
-	runner.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := runner.Start(); err != nil {
-		logf.Close()
-		return nil, err
-	}
-	logf.Close()
-	exited := make(chan error, 1)
-	go func() { exited <- runner.Wait() }()
 
-	deadline := time.After(60 * time.Second)
+	var runner *exec.Cmd
+	exited := make(chan error, 1)
+	if !m.Running(ws) {
+		// Build the image here, so progress and errors are visible.
+		if _, err := m.Image(ctx); err != nil {
+			return nil, err
+		}
+		m.progressf("starting workspace %s", ws.Name)
+		if runner, err = m.spawnRunner(ws, p); err != nil {
+			return nil, err
+		}
+		go func() { exited <- runner.Wait() }()
+	}
+	// stop ends the runner this call started, if starting failed.
+	stop := func() {
+		if runner != nil && runner.ProcessState == nil {
+			_ = syscall.Kill(-runner.Process.Pid, syscall.SIGTERM)
+		}
+	}
+
+	deadline := time.After(bootTimeout)
 	for {
 		if c, err := m.Connect(ws); err == nil {
 			if c.Ping() == nil {
@@ -394,36 +431,112 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 		}
 		select {
 		case err := <-exited:
-			return nil, fmt.Errorf("workspace VM exited (%v); see %s and %s", err, p.runnerLog, p.console)
+			runner = nil
+			if !m.Running(ws) {
+				// No runner holds the workspace: ours failed for real.
+				return nil, fmt.Errorf("workspace VM exited (%v); see %s and %s", err, p.runnerLog, p.console)
+			}
+			// Another runner won the race; keep waiting for it.
 		case <-deadline:
-			return nil, fmt.Errorf("workspace VM did not answer within 60s; see %s", p.console)
+			stop()
+			return nil, fmt.Errorf("workspace VM did not answer within %s; see %s", bootTimeout, p.console)
 		case <-ctx.Done():
+			stop()
 			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
-// Down powers the workspace's VM off and waits for its runner to exit.
+func (m *Manager) spawnRunner(ws registry.Workspace, p wsPaths) (*exec.Cmd, error) {
+	// Keep the runner log bounded: start over once it grows past its cap.
+	flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	if info, err := os.Stat(p.runnerLog); err == nil && info.Size() > runnerLogCap {
+		flags |= os.O_TRUNC
+	}
+	logf, err := os.OpenFile(p.runnerLog, flags, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer logf.Close()
+	runner := exec.Command(m.Self, "vm", "run", ws.ID)
+	runner.Stdout, runner.Stderr = logf, logf
+	runner.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := runner.Start(); err != nil {
+		return nil, err
+	}
+	return runner, nil
+}
+
+// Down stops the workspace's VM and waits for its runner to exit. It asks
+// the guest to power off; if the guest ignores that or can't be reached, it
+// signals the runner, which forces the VM off.
 func (m *Manager) Down(ws registry.Workspace) error {
 	p, err := m.paths(ws)
 	if err != nil {
 		return err
 	}
-	c, err := m.Connect(ws)
-	if err != nil {
-		return nil // not running
+	if !m.Running(ws) {
+		return nil
 	}
-	err = c.Poweroff()
-	c.Close()
-	if err != nil {
-		return err
-	}
-	for range 150 {
-		if _, err := os.Stat(p.socket); errors.Is(err, os.ErrNotExist) {
+	if c, err := m.Connect(ws); err == nil {
+		_ = c.Poweroff()
+		c.Close()
+		if m.waitStopped(ws, poweroffGrace) {
 			return nil
+		}
+	}
+	pid, err := m.runnerPID(p, ws)
+	if err != nil {
+		return fmt.Errorf("workspace %s is running but its runner can't be found (%v); see %s", ws.Name, err, p.runnerLog)
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if m.waitStopped(ws, runnerStopGrace) {
+		return nil
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL) // the VM dies with its runner
+	if m.waitStopped(ws, 5*time.Second) {
+		return nil
+	}
+	return fmt.Errorf("workspace %s did not stop; see %s", ws.Name, p.runnerLog)
+}
+
+func (m *Manager) waitStopped(ws registry.Workspace, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !m.Running(ws) {
+			return true
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("workspace %s did not stop; see %s", ws.Name, p.runnerLog)
+	return !m.Running(ws)
+}
+
+// runnerPID reads the runner's pid and checks that the process really is
+// this workspace's runner before anything signals it.
+func (m *Manager) runnerPID(p wsPaths, ws registry.Workspace) (int, error) {
+	data, err := os.ReadFile(p.pid)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 1 {
+		return 0, fmt.Errorf("bad pid file %s", p.pid)
+	}
+	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil || !strings.Contains(string(out), " vm run "+ws.ID) {
+		return 0, fmt.Errorf("process %d is not this workspace's runner", pid)
+	}
+	return pid, nil
+}
+
+// Forget deletes a stopped workspace's VM state: keys, logs and identity.
+func (m *Manager) Forget(ws registry.Workspace) error {
+	if m.Running(ws) {
+		return fmt.Errorf("workspace %s is still running", ws.Name)
+	}
+	if p, err := m.paths(ws); err == nil {
+		_ = os.Remove(p.socket)
+	}
+	return os.RemoveAll(m.StateDir(ws))
 }

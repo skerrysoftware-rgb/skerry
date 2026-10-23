@@ -22,6 +22,7 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 	"github.com/skerrysoftware-rgb/skerry/internal/shim"
+	"github.com/skerrysoftware-rgb/skerry/internal/vmm"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
@@ -137,7 +138,12 @@ func newManager(env Env) (*workspace.Manager, error) {
 	if err := dirs.Ensure(); err != nil {
 		return nil, err
 	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
 	return &workspace.Manager{
+		VMs:          &vmm.Manager{Dirs: dirs, Self: self},
 		Registry:     registry.Open(dirs.State),
 		Scope:        scope.Open(dirs.State),
 		BranchPrefix: env.Getenv("SKERRY_BRANCH_PREFIX"),
@@ -203,9 +209,16 @@ func cmdList(m *workspace.Manager, args []string, env Env) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tMODE\tBRANCH\tREPOSITORY\tCREATED BY\tAGE")
+	fmt.Fprintln(tw, "NAME\tMODE\tVM\tBRANCH\tREPOSITORY\tAGE")
 	for _, ws := range all {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Mode, ws.Branch, ws.Repo, ws.CreatedBy, age(time.Since(ws.CreatedAt)))
+		vm := "-"
+		if ws.Mode == registry.ModeSkerry {
+			vm = "stopped"
+			if v, ok := m.VMs.(*vmm.Manager); ok && v.Running(ws) {
+				vm = "running"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Mode, vm, ws.Branch, ws.Repo, age(time.Since(ws.CreatedAt)))
 	}
 	return tw.Flush()
 }
@@ -233,7 +246,8 @@ func cmdRemove(ctx context.Context, m *workspace.Manager, args []string, env Env
 	if len(pos) != 1 {
 		return fmt.Errorf("%w: rm takes one workspace name", errUsage)
 	}
-	ws, err := findByName(ctx, m, pos[0], env)
+	// Removal is destructive: inside a repository, only its own workspaces.
+	ws, err := findByName(ctx, m, pos[0], env, false)
 	if err != nil {
 		return err
 	}
@@ -249,8 +263,10 @@ func cmdRemove(ctx context.Context, m *workspace.Manager, args []string, env Env
 }
 
 // findByName looks a name up in the repository containing the current
-// directory, or across all repositories when outside one.
-func findByName(ctx context.Context, m *workspace.Manager, name string, env Env) (registry.Workspace, error) {
+// directory, or across all repositories when outside one. otherRepos also
+// accepts a name that is unique across all repositories when the current
+// one has no such workspace.
+func findByName(ctx context.Context, m *workspace.Manager, name string, env Env, otherRepos bool) (registry.Workspace, error) {
 	repo := ""
 	if wd, err := env.Getwd(); err == nil {
 		if root, err := m.Git.MainRoot(ctx, wd); err == nil {
@@ -258,7 +274,7 @@ func findByName(ctx context.Context, m *workspace.Manager, name string, env Env)
 		}
 	}
 	ws, err := m.Registry.FindByName(repo, name)
-	if errors.Is(err, registry.ErrNotFound) && repo != "" {
+	if errors.Is(err, registry.ErrNotFound) && repo != "" && otherRepos {
 		// Not in this repository; a name unique across all of them still works.
 		ws, err = m.Registry.FindByName("", name)
 	}

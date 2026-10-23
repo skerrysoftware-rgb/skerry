@@ -184,6 +184,17 @@ func (g Git) Head(ctx context.Context, dir string) (string, error) {
 	return g.run(ctx, dir, "rev-parse", "--verify", "HEAD^{commit}")
 }
 
+// TopLevel returns the top directory of the working tree containing dir.
+func (g Git) TopLevel(ctx context.Context, dir string) (string, error) {
+	return g.run(ctx, dir, "rev-parse", "--show-toplevel")
+}
+
+// CurrentBranch returns the branch checked out in dir, or "HEAD" when
+// detached.
+func (g Git) CurrentBranch(ctx context.Context, dir string) (string, error) {
+	return g.run(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
 // BranchExists reports whether a local branch exists.
 func (g Git) BranchExists(ctx context.Context, repo, branch string) (bool, error) {
 	_, err := g.run(ctx, repo, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)

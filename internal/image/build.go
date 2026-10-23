@@ -22,24 +22,21 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 )
 
-// Alpine release and mirror the images are built from.
-const (
-	Release = "v3.24"
-	Mirror  = "https://dl-cdn.alpinelinux.org/alpine"
-)
+// BasePackages are in every guest system (from the system source, Wolfi).
+// e2fsprogs formats each workspace's data disk on first boot.
+var BasePackages = []string{"wolfi-baselayout", "busybox", "glibc", "ca-certificates-bundle", "e2fsprogs", "iproute2"}
 
-// Repos are searched in order.
-var Repos = []string{"main", "community"}
-
-// BasePackages are in every rootfs.
-var BasePackages = []string{"alpine-baselayout", "alpine-release", "busybox", "busybox-binsh", "musl", "ca-certificates-bundle"}
-
-// BootModules are loaded by the agent at boot, dependencies first.
-var BootModules = []string{"fuse", "virtiofs", "overlay", "vsock", "vmw_vsock_virtio_transport_common", "vmw_vsock_virtio_transport"}
+// BootModules are loaded by the agent at boot, dependencies first: shared
+// folders, the overlay, vsock, networking and the data disk.
+var BootModules = []string{
+	"fuse", "virtiofs", "overlay",
+	"vsock", "vmw_vsock_virtio_transport_common", "vmw_vsock_virtio_transport",
+	"virtio_net", "virtio_blk", "ext4",
+}
 
 // formatVersion changes whenever the image layout changes, so old images
 // are rebuilt rather than misread.
-const formatVersion = "1"
+const formatVersion = "3"
 
 // Spec describes an image.
 type Spec struct {
@@ -73,9 +70,10 @@ type manifest struct {
 // Builder builds images into a cache directory.
 type Builder struct {
 	// Dir holds downloads and images.
-	Dir  string
-	Keys Keys
-	// Arch is Alpine's architecture name, e.g. "aarch64".
+	Dir string
+	// System provides the guest's userland; Kernel provides linux-virt.
+	System, Kernel Source
+	// Arch is the repositories' architecture name, e.g. "aarch64".
 	Arch string
 	HTTP *http.Client
 	// Log reports progress; nil discards it.
@@ -90,15 +88,19 @@ func (b *Builder) logf(format string, args ...any) {
 
 // Build returns the image for spec, building it if needed.
 func (b *Builder) Build(ctx context.Context, spec Spec) (Image, error) {
-	resolver, err := b.resolver(ctx)
+	system, err := b.resolver(ctx, b.System)
 	if err != nil {
 		return Image{}, err
 	}
-	pkgs, err := resolver.Resolve(append(append([]string{}, BasePackages...), spec.Packages...))
+	pkgs, err := system.Resolve(append(append([]string{}, BasePackages...), spec.Packages...))
 	if err != nil {
 		return Image{}, err
 	}
-	kernel, err := resolver.Resolve([]string{"linux-virt"})
+	kernelSrc, err := b.resolver(ctx, b.Kernel)
+	if err != nil {
+		return Image{}, err
+	}
+	kernel, err := kernelSrc.Resolve([]string{"linux-virt"})
 	if err != nil {
 		return Image{}, err
 	}
@@ -185,7 +187,7 @@ func (b *Builder) buildRootfs(ctx context.Context, dir string, pkgs []Package, a
 		return err
 	}
 	for i, p := range pkgs {
-		v, err := b.fetchPackage(ctx, p)
+		v, err := b.fetchPackage(ctx, b.System, p)
 		if err != nil {
 			return err
 		}
@@ -202,11 +204,51 @@ func (b *Builder) buildRootfs(ctx context.Context, dir string, pkgs []Package, a
 			}
 		}
 	}
+	if err := busyboxLinks(root); err != nil {
+		return err
+	}
 	return root.WriteFile(".skerry/agent", agent, 0o755)
 }
 
+// busyboxLinks creates the command links BusyBox lists in
+// etc/busybox-paths.d (sh, ip, mount, ...), as Wolfi's image tool does.
+// Existing files win: a real package's command is never replaced.
+func busyboxLinks(root *os.Root) error {
+	dir, err := root.Open("etc/busybox-paths.d")
+	if err != nil {
+		return nil // no BusyBox in this image
+	}
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		list, err := root.ReadFile("etc/busybox-paths.d/" + name)
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(string(list), "\n") {
+			p, err := cleanEntry(strings.TrimSpace(line))
+			if err != nil || p == "" || strings.HasSuffix(p, "/busybox") {
+				continue
+			}
+			if _, err := root.Lstat(p); err == nil {
+				continue
+			}
+			if err := makeParent(root, p); err != nil {
+				return err
+			}
+			if err := root.Symlink("/usr/bin/busybox", p); err != nil {
+				return fmt.Errorf("busybox link %s: %w", p, err)
+			}
+		}
+	}
+	return nil
+}
+
 func (b *Builder) buildBoot(ctx context.Context, dir string, kpkg Package, agent []byte) error {
-	v, err := b.fetchPackage(ctx, kpkg)
+	v, err := b.fetchPackage(ctx, b.Kernel, kpkg)
 	if err != nil {
 		return err
 	}
@@ -356,11 +398,11 @@ func fsReadDir(root *os.Root, dir string) ([]string, error) {
 	return names, err
 }
 
-// resolver loads and verifies every repository's index.
-func (b *Builder) resolver(ctx context.Context) (*Resolver, error) {
+// resolver loads and verifies every repository index of a source.
+func (b *Builder) resolver(ctx context.Context, src Source) (*Resolver, error) {
 	var all []Package
-	for _, repo := range Repos {
-		text, err := b.index(ctx, repo)
+	for _, repo := range src.Repos {
+		text, err := b.index(ctx, src, repo)
 		if err != nil {
 			return nil, err
 		}
@@ -376,66 +418,62 @@ func (b *Builder) resolver(ctx context.Context) (*Resolver, error) {
 // indexMaxAge is how long a downloaded index is reused before refreshing.
 const indexMaxAge = 24 * time.Hour
 
-func (b *Builder) index(ctx context.Context, repo string) (string, error) {
-	cached := filepath.Join(b.repoDir(repo), "APKINDEX.tar.gz")
+func (b *Builder) index(ctx context.Context, src Source, repo string) (string, error) {
+	cached := filepath.Join(b.repoDir(src, repo), "APKINDEX.tar.gz")
 	if info, err := os.Stat(cached); err == nil && time.Since(info.ModTime()) < indexMaxAge {
 		data, err := os.ReadFile(cached)
 		if err == nil {
-			if text, err := VerifyIndex(b.Keys, data); err == nil {
+			if text, err := VerifyIndex(src.Keys, data); err == nil {
 				return text, nil
 			}
 		}
 	}
-	data, err := b.download(ctx, b.repoURL(repo)+"/APKINDEX.tar.gz", 64<<20)
+	data, err := b.download(ctx, repo+"/"+b.Arch+"/APKINDEX.tar.gz", 64<<20)
 	if err != nil {
 		// Offline: an older index that still verifies is better than not
 		// starting at all. Fresh packages wait for the next refresh.
 		if cachedData, cerr := os.ReadFile(cached); cerr == nil {
-			if text, verr := VerifyIndex(b.Keys, cachedData); verr == nil {
+			if text, verr := VerifyIndex(src.Keys, cachedData); verr == nil {
 				b.logf("using the cached %s index (refresh failed: %v)", repo, err)
 				return text, nil
 			}
 		}
 		return "", err
 	}
-	text, err := VerifyIndex(b.Keys, data)
+	text, err := VerifyIndex(src.Keys, data)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", repo, err)
 	}
-	if err := os.MkdirAll(b.repoDir(repo), 0o755); err != nil {
+	if err := os.MkdirAll(b.repoDir(src, repo), 0o755); err != nil {
 		return "", err
 	}
 	return text, fsutil.WriteFileAtomic(cached, data, 0o644)
 }
 
-func (b *Builder) fetchPackage(ctx context.Context, p Package) (*Verified, error) {
-	cached := filepath.Join(b.repoDir(p.Repo), p.File())
+func (b *Builder) fetchPackage(ctx context.Context, src Source, p Package) (*Verified, error) {
+	cached := filepath.Join(b.repoDir(src, p.Repo), p.File())
 	if data, err := os.ReadFile(cached); err == nil {
-		if v, err := VerifyPackage(b.Keys, p, data); err == nil {
+		if v, err := VerifyPackage(src.Keys, p, data); err == nil {
 			return v, nil
 		}
 	}
 	b.logf("downloading %s", p.File())
-	data, err := b.download(ctx, b.repoURL(p.Repo)+"/"+p.File(), p.Size)
+	data, err := b.download(ctx, p.Repo+"/"+b.Arch+"/"+p.File(), p.Size)
 	if err != nil {
 		return nil, err
 	}
-	v, err := VerifyPackage(b.Keys, p, data)
+	v, err := VerifyPackage(src.Keys, p, data)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(b.repoDir(p.Repo), 0o755); err != nil {
+	if err := os.MkdirAll(b.repoDir(src, p.Repo), 0o755); err != nil {
 		return nil, err
 	}
 	return v, fsutil.WriteFileAtomic(cached, data, 0o644)
 }
 
-func (b *Builder) repoURL(repo string) string {
-	return Mirror + "/" + Release + "/" + repo + "/" + b.Arch
-}
-
-func (b *Builder) repoDir(repo string) string {
-	return filepath.Join(b.Dir, "alpine", Release, repo, b.Arch)
+func (b *Builder) repoDir(src Source, repo string) string {
+	return filepath.Join(b.Dir, "packages", src.Name, repoKey(repo), b.Arch)
 }
 
 func (b *Builder) download(ctx context.Context, url string, limit int64) ([]byte, error) {

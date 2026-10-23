@@ -18,6 +18,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
+
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
 )
 
 // Paths the agent uses inside the guest.
@@ -154,6 +156,11 @@ func loadModules(dir string) error {
 // PID1 runs in the real root. It sets up the remaining mounts, then either
 // runs install scripts (finalize) or starts the server and reaps orphans.
 func PID1() error {
+	// Registered first: until then a stop request would be lost (PID 1
+	// ignores signals it has no handler for), and the host would wait out
+	// its grace period.
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGPWR)
 	for _, m := range []struct{ src, dst, typ, data string }{
 		{"tmpfs", "/tmp", "tmpfs", "mode=1777"},
 		{"devpts", "/dev/pts", "devpts", "gid=5,mode=620,ptmxmode=666"},
@@ -174,6 +181,16 @@ func PID1() error {
 		_ = unix.Sethostname([]byte(cfg.Hostname))
 		addHostsEntry(cfg.Hostname)
 	}
+	if cfg.Network != nil {
+		if err := setupNetwork(cfg.Network); err != nil {
+			logger.Printf("network: %v", err)
+		}
+	}
+	if cfg.DataDisk {
+		if err := mountDataDisk(); err != nil {
+			logger.Printf("data disk: %v", err)
+		}
+	}
 	if cfg.Mode == ModeFinalize {
 		err := finalize()
 		if err != nil {
@@ -183,29 +200,80 @@ func PID1() error {
 		return err
 	}
 
-	// The server runs as a child; PID 1 only reaps. Orphaned processes are
-	// reparented here, and waiting for them keeps zombies from piling up.
-	signal.Ignore(syscall.SIGHUP)
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGPWR)
-	child := startServe()
+	// The server and the service supervisor run as children; PID 1 restarts
+	// them and reaps orphans. Orphaned processes are reparented here, and
+	// waiting for them keeps zombies from piling up.
+	// PID 1 must not die of SIGHUP, but ignoring it would be inherited by
+	// every command; a handled signal is reset to default across exec.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
+	children := map[int]*child{}
+	restarts := make(chan *child, 4)
+	start := func(c *child) {
+		c.started = time.Now()
+		if pid := startChild(c.role); pid > 0 {
+			children[pid] = c
+		} else {
+			time.AfterFunc(time.Second, func() { restarts <- c }) // try again
+		}
+	}
+	start(&child{role: "serve"})
+	if len(cfg.Services) > 0 {
+		start(&child{role: "services"})
+	}
 	for {
 		var ws unix.WaitStatus
 		pid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
-		switch {
-		case err == nil && pid == child:
-			logger.Printf("server exited (%v); restarting", ws)
-			time.Sleep(time.Second)
-			child = startServe()
-		case err == nil && pid > 0:
-			continue // reaped an orphan; look for more
+		if err == nil && pid > 0 {
+			if c, ok := children[pid]; ok {
+				delete(children, pid)
+				// Back off a child that keeps failing at once.
+				if time.Since(c.started) > time.Minute {
+					c.backoff = 0
+				}
+				c.backoff = min(max(2*c.backoff, time.Second), 30*time.Second)
+				logger.Printf("%s exited (%v); restarting in %s", c.role, ws, c.backoff)
+				time.AfterFunc(c.backoff, func() { restarts <- c })
+			}
+			continue // look for more
 		}
 		select {
+		case c := <-restarts:
+			start(c)
 		case <-sigterm:
-			poweroff()
+			shutdown(children)
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// child is a process PID 1 keeps running.
+type child struct {
+	role    string
+	started time.Time
+	backoff time.Duration
+}
+
+// shutdown stops the services cleanly, so databases don't need recovery at
+// the next boot, then powers off.
+func shutdown(children map[int]*child) {
+	for pid, c := range children {
+		if c.role == "services" {
+			_ = unix.Kill(pid, unix.SIGTERM)
+			deadline := time.Now().Add(stopGrace + 4*time.Second)
+			for time.Now().Before(deadline) {
+				var ws unix.WaitStatus
+				if p, _ := unix.Wait4(pid, &ws, unix.WNOHANG, nil); p == pid {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+	if isMountPoint(dataMount) {
+		unix.Sync()
+		_ = unix.Unmount(dataMount, 0)
+	}
+	poweroff()
 }
 
 // loopbackUp brings up lo; the kernel then assigns 127.0.0.1 and ::1.
@@ -240,11 +308,11 @@ func addHostsEntry(name string) {
 	fmt.Fprintf(f, "127.0.1.1\t%s\n", name)
 }
 
-func startServe() int {
-	cmd := exec.Command(agentPath, "serve")
+func startChild(role string) int {
+	cmd := exec.Command(agentPath, role)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
-		logger.Printf("start server: %v", err)
+		logger.Printf("start %s: %v", role, err)
 		return -1
 	}
 	return cmd.Process.Pid
@@ -264,9 +332,15 @@ func Serve() error {
 	if err != nil {
 		return fmt.Errorf("authorized key: %w", err)
 	}
+	cfg, err := ReadConfig(shareMount)
+	if err != nil {
+		return err
+	}
 	srv := NewServer(hostKey, clientKey)
 	srv.Log = logger
-	srv.Poweroff = poweroff
+	srv.Env = services.Env(cfg.Services, cfg.Secret)
+	// PID 1 stops the services cleanly before powering off.
+	srv.Poweroff = func() { _ = unix.Kill(1, unix.SIGTERM) }
 	l, err := listenVsock(Port)
 	if err != nil {
 		return err

@@ -5,6 +5,8 @@ package engine
 import (
 	"errors"
 	"io"
+	"net"
+	"os"
 )
 
 // Config describes one VM.
@@ -26,6 +28,13 @@ type Config struct {
 	MachineIDFile string
 	// Console receives the guest's console output.
 	Console io.Writer
+	// Network is the VM's end of a datagram socket carrying Ethernet
+	// frames (see netx.FramePair); nil gives the VM no network card.
+	Network *os.File
+	MAC     net.HardwareAddr
+	// DataDisk is a raw disk image attached as the VM's first block
+	// device; empty attaches none.
+	DataDisk string
 }
 
 // ErrUnsupported is returned on platforms without a driver.

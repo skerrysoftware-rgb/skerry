@@ -81,6 +81,9 @@ func Git(ws registry.Workspace) gitx.Git {
 // Finding is something the scan found and dealt with.
 type Finding struct {
 	Path string
+	// Kind is what was found, in skerry's own words.
+	Kind string
+	// What is Kind, plus any error moving it.
 	What string
 	// Quarantined is where it was moved; empty if only reported.
 	Quarantined string
@@ -185,7 +188,7 @@ func isBareRepo(dir string) bool {
 func quarantine(path, what string) Finding {
 	dest := path + ".skerry-quarantine-" + strconv.FormatInt(time.Now().Unix(), 10)
 	if err := os.Rename(path, dest); err != nil {
-		return Finding{Path: path, What: what + " (could not move it: " + err.Error() + ")"}
+		return Finding{Path: path, Kind: what, What: what + " (could not move it: " + err.Error() + ")"}
 	}
-	return Finding{Path: path, What: what, Quarantined: dest}
+	return Finding{Path: path, Kind: what, What: what, Quarantined: dest}
 }

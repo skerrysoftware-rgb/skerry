@@ -72,6 +72,9 @@ type CreateOptions struct {
 	Name string
 	// CreatedBy records what asked for it, e.g. "cli" or "claude".
 	CreatedBy string
+	// Base is the branch or commit to start from; empty means the
+	// repository's default branch, as Claude Code does.
+	Base string
 }
 
 // Create makes a worktree on a new branch and registers it. Inside an
@@ -109,6 +112,9 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	}
 	path := filepath.Join(parent, o.Name)
 	if info, err := os.Lstat(path); err == nil {
+		if o.Base != "" {
+			return registry.Workspace{}, fmt.Errorf("%s already exists; a starting point applies only to a new workspace", path)
+		}
 		if existing, err := m.Registry.FindByPath(path); err == nil && existing.Path == path && info.IsDir() {
 			return existing, nil
 		}
@@ -134,7 +140,9 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	}
 
 	var base string
-	if m.BaseFromHead {
+	if o.Base != "" {
+		base, err = m.Git.Commit(ctx, from, o.Base)
+	} else if m.BaseFromHead {
 		base, err = m.Git.Head(ctx, from)
 	} else {
 		base, err = m.Git.DefaultBase(ctx, from)

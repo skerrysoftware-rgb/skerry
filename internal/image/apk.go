@@ -1,8 +1,11 @@
-// Package image builds workspace images from Alpine Linux packages.
+// Package image builds workspace images from signed apk packages: the
+// guest system from Wolfi (glibc-based, so native modules built for
+// ordinary Linux work) and the kernel from Alpine.
 //
-// Nothing enters an image unverified. Trust starts at Alpine's package
-// signing keys, pinned in this package (keys/), which were themselves checked
-// through Alpine's release GPG key. From there:
+// Nothing enters an image unverified. Trust starts at each source's signing
+// keys, pinned in this package (keys/<source>/). Alpine's were checked through
+// its release GPG key; Wolfi's matched on its package server and in its
+// GitHub repository. From there:
 //
 //	signed APKINDEX → each package's control-section hash (index C: field)
 //	→ the control section's datahash → the data section
@@ -28,21 +31,22 @@ import (
 	"strings"
 )
 
-//go:embed keys/*.rsa.pub
+//go:embed keys
 var keyFiles embed.FS
 
-// Keys maps an Alpine signing key's file name to the key.
+// Keys maps a signing key's file name to the key.
 type Keys map[string]*rsa.PublicKey
 
-// TrustedKeys returns the pinned Alpine signing keys.
-func TrustedKeys() (Keys, error) {
-	entries, err := keyFiles.ReadDir("keys")
+// TrustedKeys returns the pinned signing keys for one source ("alpine" or
+// "wolfi"). Each source is verified only with its own keys.
+func TrustedKeys(source string) (Keys, error) {
+	entries, err := keyFiles.ReadDir("keys/" + source)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no pinned keys for %q: %w", source, err)
 	}
 	keys := Keys{}
 	for _, e := range entries {
-		data, err := keyFiles.ReadFile("keys/" + e.Name())
+		data, err := keyFiles.ReadFile("keys/" + source + "/" + e.Name())
 		if err != nil {
 			return nil, err
 		}
@@ -213,10 +217,18 @@ func VerifyPackage(keys Keys, pkg Package, blob []byte) (*Verified, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("%s: %d gzip members, want 3", name, len(parts))
+	// Alpine signs each package (signature, control, data); Wolfi relies on
+	// the signed index alone (control, data). Either way the chain below
+	// is what establishes trust.
+	var sig, control, data []byte
+	switch len(parts) {
+	case 3:
+		sig, control, data = parts[0], parts[1], parts[2]
+	case 2:
+		control, data = parts[0], parts[1]
+	default:
+		return nil, fmt.Errorf("%s: %d gzip members, want 2 or 3", name, len(parts))
 	}
-	sig, control, data := parts[0], parts[1], parts[2]
 
 	want, err := controlHash(pkg.Checksum)
 	if err != nil {
@@ -225,9 +237,11 @@ func VerifyPackage(keys Keys, pkg Package, blob []byte) (*Verified, error) {
 	if got := sha1.Sum(control); !bytes.Equal(got[:], want) { //nolint:gosec // format-mandated
 		return nil, fmt.Errorf("%s: control section does not match the signed index", name)
 	}
-	// Redundant with the index check, but cheap: the package is signed too.
-	if _, err := verifySignature(keys, sig, control); err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
+	if sig != nil {
+		// Redundant with the index check, but cheap: the package is signed too.
+		if _, err := verifySignature(keys, sig, control); err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
 	}
 
 	files, err := readTarFiles(control, maxControlFile)

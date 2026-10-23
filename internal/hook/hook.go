@@ -11,10 +11,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/guard"
+	"github.com/skerrysoftware-rgb/skerry/internal/project"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
 
@@ -168,13 +171,14 @@ func (h *Handler) sessionStart(in Input) error {
 		}
 		warnings := plantedWarnings(ws)
 		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s."+
-			" The workspace has its own lightweight Linux VM (Alpine), isolated from other workspaces:"+
-			" its own processes, ports and /tmp. The checkout is mounted at the same path inside the VM."+
+			" The workspace has its own lightweight Linux VM (Wolfi), isolated from other workspaces:"+
+			" its own processes, ports, /tmp and services. The checkout is mounted at the same path inside the VM."+
 			" `node`, `npm`, `npx`, `yarn`, `pnpm` and `corepack` run inside the VM automatically;"+
 			" every other command, git included, runs on the host as usual."+
 			" To run anything else inside the VM, use `skerry exec -- <command>`"+
-			" (for example `skerry exec -- sh -c 'ls /tmp'`). The VM has no network access yet.",
-			ws.Name, ws.Path, ws.Branch) + warnings
+			" (for example `skerry exec -- sh -c 'ls /tmp'`)."+
+			" The VM can reach the public internet (package registries, APIs) but not this machine, its local network or cloud metadata.",
+			ws.Name, ws.Path, ws.Branch) + servicesContext(ws) + warnings
 	} else {
 		// A plain worktree: say once per repository that skerry is
 		// available, then stay out of the way.
@@ -193,6 +197,31 @@ func (h *Handler) sessionStart(in Input) error {
 			"additionalContext": context,
 		},
 	})
+}
+
+// servicesContext tells Claude which services the workspace runs and how
+// commands find them.
+func servicesContext(ws registry.Workspace) string {
+	proj, err := project.Load(ws.Path)
+	if err != nil {
+		// The error can quote the file, which the repository (and the VM)
+		// controls; keep that text out of Claude's context.
+		return fmt.Sprintf(" This project's %s is invalid, so the workspace runs no services; `skerry status` shows why.", project.FileName)
+	}
+	if len(proj.Services) == 0 {
+		return ""
+	}
+	var vars []string
+	for k := range services.Env(proj.Services, "x") {
+		vars = append(vars, k)
+	}
+	sort.Strings(vars)
+	return fmt.Sprintf(" The VM runs this workspace's own %s (%s), with data that persists across restarts and is separate from every other workspace."+
+		" Commands in the VM get %s, so apps and migrations connect without configuration; use the variables rather than hard-coding URLs."+
+		" They are set in the environment, so they win over the same names in a .env file (dotenv loaders don't override existing variables)."+
+		" Tools such as psql, valkey-cli and temporal are available through `skerry exec -- <tool>`."+
+		" `skerry status` lists the services and the ports they are forwarded to on this machine.",
+		strings.Join(proj.Services, ", "), proj.Source, strings.Join(vars, ", "))
 }
 
 // appendLines adds lines to Claude's env file, which it sources before every
@@ -225,14 +254,28 @@ func (h *Handler) getenv(name string) string {
 
 // plantedWarnings checks the checkout for files a VM may have planted for
 // host tools, quarantines them, and returns text for Claude's context.
+//
+// The paths and the .git contents are the VM's to choose, so none of them
+// goes into Claude's context: only what kind of thing was found, in skerry's
+// own words.
 func plantedWarnings(ws registry.Workspace) string {
 	var b strings.Builder
 	if err := guard.CheckPointer(ws); err != nil {
-		fmt.Fprintf(&b, " WARNING: %v. Do not run git in this worktree; tell the user.", err)
+		b.WriteString(" WARNING: this worktree's .git pointer was changed from inside the VM. Do not run git in this worktree; tell the user.")
 	}
 	found, _ := guard.Scan(context.Background(), ws)
-	for _, f := range found {
-		fmt.Fprintf(&b, " WARNING: skerry found and quarantined %s. Tell the user; do not restore it without their review.", f)
+	if len(found) > 0 {
+		kinds := map[string]bool{}
+		for _, f := range found {
+			kinds[f.Kind] = true
+		}
+		var list []string
+		for k := range kinds {
+			list = append(list, k)
+		}
+		sort.Strings(list)
+		fmt.Fprintf(&b, " WARNING: skerry found %d item(s) in this worktree that a VM may have planted for host tools (%s) and renamed each with a .skerry-quarantine- suffix."+
+			" Tell the user; do not restore them without their review.", len(found), strings.Join(list, "; "))
 	}
 	return b.String()
 }

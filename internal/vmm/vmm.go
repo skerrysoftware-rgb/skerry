@@ -9,14 +9,22 @@ package vmm
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,12 +36,16 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/image"
+	"github.com/skerrysoftware-rgb/skerry/internal/netx"
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
+	"github.com/skerrysoftware-rgb/skerry/internal/project"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
+	"github.com/skerrysoftware-rgb/skerry/internal/termsafe"
 )
 
-// Packages every workspace image gets in this release.
-var Packages = []string{"nodejs", "npm"}
+// Packages every workspace image gets in this release; services add theirs.
+var Packages = []string{"nodejs-24", "npm", "curl"}
 
 // Resources and limits for each workspace VM.
 const (
@@ -43,13 +55,25 @@ const (
 	consoleCap = 8 << 20
 	// runnerLogCap bounds the runner's own log.
 	runnerLogCap = 1 << 20
+	// networkLogCap bounds the log of refused connections, which the
+	// guest controls.
+	networkLogCap = 1 << 20
+	// dataDiskSize is the data disk's capacity. The file is sparse: it
+	// uses only what the guest writes.
+	dataDiskSize = 64 << 30
+	// servicesTimeout bounds waiting for services at startup; the first
+	// boot initializes their data.
+	servicesTimeout = 3 * time.Minute
 )
 
 // Timeouts for starting and stopping.
 const (
-	bootTimeout     = 60 * time.Second
-	poweroffGrace   = 10 * time.Second
-	runnerStopGrace = 20 * time.Second
+	bootTimeout = 60 * time.Second
+	// poweroffGrace covers the guest stopping its services cleanly.
+	poweroffGrace = 20 * time.Second
+	// runnerStopGrace gives a runner time to power its VM off (up to
+	// poweroffGrace) and then force it off.
+	runnerStopGrace = poweroffGrace + 15*time.Second
 )
 
 // Manager starts, stops and connects to workspace VMs.
@@ -70,6 +94,7 @@ func (m *Manager) progressf(format string, args ...any) {
 // Workspace paths.
 type wsPaths struct {
 	state, share, socket, lock, console, runnerLog, pid, machineID string
+	dataDisk, secret, status, networkLog, image                    string
 }
 
 func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
@@ -79,14 +104,19 @@ func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
 	}
 	state := m.StateDir(ws)
 	return wsPaths{
-		state:     state,
-		share:     filepath.Join(state, "share"),
-		socket:    filepath.Join(sockDir, ws.ID+".sock"),
-		lock:      filepath.Join(state, "runner.lock"),
-		console:   filepath.Join(state, "console.log"),
-		runnerLog: filepath.Join(state, "runner.log"),
-		pid:       filepath.Join(state, "runner.pid"),
-		machineID: filepath.Join(state, "machine-id"),
+		state:      state,
+		share:      filepath.Join(state, "share"),
+		socket:     filepath.Join(sockDir, ws.ID+".sock"),
+		lock:       filepath.Join(state, "runner.lock"),
+		console:    filepath.Join(state, "console.log"),
+		runnerLog:  filepath.Join(state, "runner.log"),
+		pid:        filepath.Join(state, "runner.pid"),
+		machineID:  filepath.Join(state, "machine-id"),
+		dataDisk:   filepath.Join(state, "data.img"),
+		secret:     filepath.Join(state, "secret"),
+		status:     filepath.Join(state, "status.json"),
+		networkLog: filepath.Join(state, "network.log"),
+		image:      filepath.Join(state, "image"),
 	}, nil
 }
 
@@ -114,30 +144,34 @@ func socketDir() (string, error) {
 	return dir, nil
 }
 
-// Image returns the workspace image, building and finalizing it if needed.
-func (m *Manager) Image(ctx context.Context) (image.Image, error) {
+// Image returns the image for a project, building and finalizing it if
+// needed.
+func (m *Manager) Image(ctx context.Context, proj project.Project) (image.Image, error) {
 	agentBin, err := assets.Agent()
 	if err != nil {
 		return image.Image{}, err
 	}
-	keys, err := image.TrustedKeys()
+	b, err := m.builder()
 	if err != nil {
 		return image.Image{}, err
-	}
-	b := &image.Builder{
-		Dir: m.Dirs.Cache, Keys: keys, Arch: alpineArch(),
-		Log: func(f string, a ...any) { m.progressf("  "+f, a...) },
 	}
 	if err := os.MkdirAll(filepath.Join(m.Dirs.Cache, "images"), 0o755); err != nil {
 		return image.Image{}, err
 	}
-	spec := image.Spec{Packages: Packages, Agent: agentBin}
-	img, err := b.Build(ctx, spec)
-	if err != nil {
-		return image.Image{}, err
+	spec := image.Spec{Packages: append(slices.Clone(Packages), services.Packages(proj.Services)...), Agent: agentBin}
+	// A pinned image is used as it is; otherwise the newest packages are
+	// resolved, and the result (perhaps the same image) is pinned afresh.
+	img, pinned := b.Pinned(spec, imageMaxAge)
+	if !pinned {
+		if img, err = b.Build(ctx, spec); err != nil {
+			return image.Image{}, err
+		}
 	}
 	if img.Finalized {
-		return img, nil
+		if pinned {
+			return img, nil
+		}
+		return img, b.Pin(spec, img)
 	}
 	// One finalize per image, even with several workspaces starting at once.
 	unlock, err := fsutil.Lock(img.Dir + ".lock")
@@ -145,21 +179,67 @@ func (m *Manager) Image(ctx context.Context) (image.Image, error) {
 		return image.Image{}, err
 	}
 	defer unlock()
-	if img, err = b.Build(ctx, spec); err != nil || img.Finalized {
+	if img, err = b.Build(ctx, spec); err != nil {
 		return img, err
+	}
+	if img.Finalized {
+		return img, b.Pin(spec, img)
 	}
 	m.progressf("  running package install scripts in a build VM")
 	if err := m.finalize(ctx, img); err != nil {
 		return image.Image{}, err
 	}
-	return img, b.MarkFinalized(img)
+	if err := b.MarkFinalized(img); err != nil {
+		return image.Image{}, err
+	}
+	img.Finalized = true
+	return img, b.Pin(spec, img)
 }
 
-func alpineArch() string {
-	if runtime.GOARCH == "amd64" {
-		return "x86_64"
+// imageMaxAge is how long a project keeps the image built for it before
+// skerry rebuilds it with the newest packages (security fixes included).
+const imageMaxAge = 7 * 24 * time.Hour
+
+// builder is the image builder for this machine.
+func (m *Manager) builder() (*image.Builder, error) {
+	system, err := image.Wolfi()
+	if err != nil {
+		return nil, err
 	}
-	return "aarch64"
+	kernel, err := image.Alpine()
+	if err != nil {
+		return nil, err
+	}
+	return &image.Builder{
+		Dir: m.Dirs.Cache, System: system, Kernel: kernel, Arch: image.WolfiArch(runtime.GOARCH),
+		Log: func(f string, a ...any) { m.progressf("  "+f, a...) },
+	}, nil
+}
+
+// Collect deletes images and downloads no workspace needs: images not
+// pinned for any project and not in use by a running workspace.
+func (m *Manager) Collect(all []registry.Workspace) ([]string, error) {
+	b, err := m.builder()
+	if err != nil {
+		return nil, err
+	}
+	inUse := map[string]bool{}
+	for _, ws := range all {
+		if !m.Running(ws) {
+			continue
+		}
+		p, err := m.paths(ws)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(p.image)
+		if err != nil {
+			// A running workspace whose image isn't known: keep everything.
+			return nil, fmt.Errorf("workspace %s is running an unknown image; stop it and retry", ws.Name)
+		}
+		inUse[strings.TrimSpace(string(data))] = true
+	}
+	return b.Collect(inUse, imageMaxAge)
 }
 
 // finalize boots the image with its rootfs writable so the packages'
@@ -242,24 +322,56 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	if err != nil {
 		return err
 	}
-	unlock, ok, err := fsutil.TryLock(p.lock)
-	if err != nil {
-		return err
+	// Running() takes the lock for a moment to test it, so retry briefly
+	// before concluding another runner owns the workspace.
+	var unlock func()
+	ok := false
+	for attempt := 0; attempt < 10 && !ok; attempt++ {
+		if attempt > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if unlock, ok, err = fsutil.TryLock(p.lock); err != nil {
+			return err
+		}
 	}
 	if !ok {
 		return nil // another runner owns this workspace
 	}
 	defer unlock()
 
-	img, err := m.Image(ctx)
+	proj, err := project.Load(ws.Path)
+	if err != nil {
+		return err
+	}
+	img, err := m.Image(ctx, proj)
 	if err != nil {
 		return err
 	}
 	if err := guard.Protect(ws); err != nil {
 		return fmt.Errorf("protect %s/.git: %w", ws.Path, err)
 	}
+	// So skerry gc never deletes the image under a running VM.
+	if err := fsutil.WriteFileAtomic(p.image, []byte(img.ID+"\n"), 0o600); err != nil {
+		return err
+	}
 	// Written once, before boot, while nothing reads it.
-	cfg := agent.Config{Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name)}
+	cfg := agent.Config{
+		Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name),
+		Network: &agent.Network{
+			Address: netip.PrefixFrom(netx.GuestIP, netx.PrefixLen),
+			Gateway: netx.GatewayIP, DNS: netx.GatewayIP,
+		},
+	}
+	dataDisk := ""
+	if len(proj.Services) > 0 {
+		if cfg.Secret, err = secret(p.secret); err != nil {
+			return err
+		}
+		if err := ensureDisk(p.dataDisk, dataDiskSize); err != nil {
+			return err
+		}
+		cfg.Services, cfg.DataDisk, dataDisk = proj.Services, true, p.dataDisk
+	}
 	if err := agent.WriteConfig(p.share, cfg); err != nil {
 		return err
 	}
@@ -269,14 +381,44 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	}
 	defer console.Close()
 
+	// Opened first so it is closed last, after the network stops logging.
+	netLog, err := fsutil.OpenCappedLog(p.networkLog, networkLogCap)
+	if err != nil {
+		return err
+	}
+	defer netLog.Close()
+	network, err := netx.New(netx.DefaultPolicy)
+	if err != nil {
+		return err
+	}
+	defer network.Close()
+	network.Log = log.New(netLog, "", log.LstdFlags)
+	vmNet, hostNet, err := netx.FramePair()
+	if err != nil {
+		return err
+	}
+	netCtx, stopNet := context.WithCancel(context.Background())
+	defer stopNet()
+	network.Attach(netCtx, hostNet)
+
 	vm, err := engine.Start(engine.Config{
 		Kernel: img.Kernel, Initramfs: img.Initramfs, Rootfs: img.Rootfs,
 		ConfigDir: p.share, WorkDir: ws.Path, CPUs: CPUs, MemoryMiB: MemoryMiB,
 		MachineIDFile: p.machineID, Console: console,
+		Network: vmNet, MAC: macFor(ws.ID), DataDisk: dataDisk,
 	})
 	if err != nil {
+		vmNet.Close()
 		return err
 	}
+	dialer := &guestDialer{vm: vm, keys: keys, open: map[net.Conn]bool{}}
+	defer dialer.close()
+	forwards, closeForwards := m.forward(dialer, p, proj)
+	defer closeForwards()
+	if err := writeStatus(p.status, Status{Hostname: hostname(ws.Name), Services: proj.Services, Source: proj.Source, Forwards: forwards}); err != nil {
+		fmt.Fprintf(os.Stderr, "write status: %v\n", err)
+	}
+	defer os.Remove(p.status)
 	// Only the lock holder gets here, so a socket left at this path is stale.
 	_ = os.Remove(p.socket)
 	l, err := net.Listen("unix", p.socket)
@@ -327,7 +469,12 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	case <-vm.Done():
 	case <-time.After(poweroffGrace):
 		_ = vm.Stop()
-		<-vm.Done()
+		select {
+		case <-vm.Done():
+		case <-time.After(10 * time.Second):
+			// The framework didn't stop it; exiting ends the VM with us.
+			return errors.New("the VM did not stop")
+		}
 	}
 	return nil
 }
@@ -394,8 +541,62 @@ func (m *Manager) Connect(ws registry.Workspace) (*agent.Client, error) {
 }
 
 // Up starts the workspace's VM in the background, if it isn't running, and
-// waits until its agent answers.
+// waits until its agent answers and its services are ready.
 func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client, error) {
+	c, err := m.boot(ctx, ws)
+	if err != nil {
+		return nil, err
+	}
+	// A command may not need the services, so a failed service is a
+	// warning, not a reason to refuse to run anything.
+	if err := m.waitServices(ctx, c); err != nil {
+		if ctx.Err() != nil {
+			c.Close()
+			return nil, ctx.Err()
+		}
+		m.progressf("WARNING: %s", termsafe.Clean(err.Error()))
+	}
+	return c, nil
+}
+
+// limitedBuffer keeps the first max bytes written to it and drops the rest.
+type limitedBuffer struct {
+	max int
+	b   strings.Builder
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if room := l.max - l.b.Len(); room > 0 {
+		l.b.Write(p[:min(len(p), room)])
+	}
+	return len(p), nil
+}
+
+func (l *limitedBuffer) String() string { return l.b.String() }
+
+// waitServices blocks until the guest reports every service ready. It
+// costs one round trip when they already are.
+func (m *Manager) waitServices(ctx context.Context, c *agent.Client) error {
+	slow := time.AfterFunc(time.Second, func() { m.progressf("waiting for services to start") })
+	defer slow.Stop()
+	// The guest decides when this ends and what it prints, so bound both.
+	ctx, cancel := context.WithTimeout(ctx, servicesTimeout+30*time.Second)
+	defer cancel()
+	out := &limitedBuffer{max: 4 << 10}
+	code, err := c.Run(ctx, agent.Cmd{
+		Args:   []string{"/.skerry/agent", "wait", servicesTimeout.String()},
+		Stdout: out, Stderr: out,
+	})
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("services did not start: %s", strings.TrimSpace(out.String()))
+	}
+	return nil
+}
+
+func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Client, error) {
 	if ws.Mode != registry.ModeSkerry {
 		return nil, fmt.Errorf("%s is a plain worktree; to use skerry here, run: skerry enable %s", ws.Name, ws.Repo)
 	}
@@ -414,7 +615,11 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 	exited := make(chan error, 1)
 	if !m.Running(ws) {
 		// Build the image here, so progress and errors are visible.
-		if _, err := m.Image(ctx); err != nil {
+		proj, err := project.Load(ws.Path)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := m.Image(ctx, proj); err != nil {
 			return nil, err
 		}
 		m.progressf("starting workspace %s", ws.Name)
@@ -539,6 +744,32 @@ func (m *Manager) runnerPID(p wsPaths, ws registry.Workspace) (int, error) {
 	return pid, nil
 }
 
+// ResetData deletes a stopped workspace's data disk; the next start makes
+// a blank one.
+func (m *Manager) ResetData(ws registry.Workspace) error {
+	if m.Running(ws) {
+		return fmt.Errorf("workspace %s is still running", ws.Name)
+	}
+	p, err := m.paths(ws)
+	if err != nil {
+		return err
+	}
+	// Hold the runner's lock, so nothing can start the VM on this disk
+	// while it is deleted.
+	unlock, ok, err := fsutil.TryLock(p.lock)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("workspace %s started again; stop it and retry", ws.Name)
+	}
+	defer unlock()
+	if err := os.Remove(p.dataDisk); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Forget deletes a stopped workspace's VM state: keys, logs and identity.
 func (m *Manager) Forget(ws registry.Workspace) error {
 	if m.Running(ws) {
@@ -562,11 +793,171 @@ func watchCheckout(ctx context.Context, ws registry.Workspace) {
 		case <-t.C:
 		}
 		if err := guard.CheckPointer(ws); err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
+			fmt.Fprintf(os.Stderr, "WARNING: %s\n", termsafe.Clean(err.Error()))
 		}
 		found, _ := guard.Scan(ctx, ws)
 		for _, f := range found {
-			fmt.Fprintf(os.Stderr, "WARNING: found %s\n", f)
+			fmt.Fprintf(os.Stderr, "WARNING: found %s\n", termsafe.Clean(f.String()))
 		}
 	}
+}
+
+// Status is what a running workspace exposes, written by its runner.
+type Status struct {
+	// Hostname names the workspace in .localhost URLs.
+	Hostname string    `json:"hostname"`
+	Services []string  `json:"services,omitempty"`
+	Source   string    `json:"source,omitempty"`
+	Forwards []Forward `json:"forwards,omitempty"`
+}
+
+// Forward is a guest port reachable on the host's loopback interface.
+type Forward struct {
+	Name  string `json:"name"`
+	Guest uint16 `json:"guest"`
+	Host  uint16 `json:"host"`
+	// Web says it serves HTTP.
+	Web bool `json:"web,omitempty"`
+}
+
+func writeStatus(path string, st Status) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(path, append(data, '\n'), 0o600)
+}
+
+// Status reports a running workspace's services and forwards, and the
+// password its services use.
+func (m *Manager) Status(ws registry.Workspace) (Status, string, error) {
+	var st Status
+	p, err := m.paths(ws)
+	if err != nil {
+		return st, "", err
+	}
+	data, err := os.ReadFile(p.status)
+	if err != nil {
+		return st, "", err
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		return st, "", err
+	}
+	pw, _ := os.ReadFile(p.secret)
+	return st, strings.TrimSpace(string(pw)), nil
+}
+
+// forward exposes the services' ports and the project's own on the host's
+// loopback interface. Each guest port keeps the host port it had last
+// time when that is free, so URLs stay stable across restarts.
+func (m *Manager) forward(d *guestDialer, p wsPaths, proj project.Project) ([]Forward, func()) {
+	var want []Forward
+	known := map[uint16]services.Port{}
+	for _, name := range proj.Services {
+		preset, _ := services.Lookup(name)
+		for _, port := range preset.Ports {
+			known[port.Guest] = port
+			if port.Forward {
+				want = append(want, Forward{Name: port.Name, Guest: port.Guest, Web: port.Web})
+			}
+		}
+	}
+	// The project's own ports; they serve the project's apps, so they are
+	// treated as web servers unless a service owns them.
+	for _, port := range proj.Ports {
+		f := Forward{Name: "port " + strconv.Itoa(int(port)), Guest: port, Web: true}
+		if k, ok := known[port]; ok {
+			f.Name, f.Web = k.Name, k.Web
+		}
+		want = append(want, f)
+	}
+	previous := map[uint16]uint16{}
+	if data, err := os.ReadFile(p.status + ".ports"); err == nil {
+		_ = json.Unmarshal(data, &previous)
+	}
+	var (
+		got       []Forward
+		listeners []net.Listener
+		seen      = map[uint16]bool{}
+	)
+	for _, f := range want {
+		if seen[f.Guest] {
+			continue
+		}
+		seen[f.Guest] = true
+		l, err := d.listen(previous[f.Guest], f.Guest)
+		if err != nil && previous[f.Guest] != 0 {
+			l, err = d.listen(0, f.Guest)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "forward %s: %v\n", f.Name, err)
+			continue
+		}
+		f.Host = uint16(l.Addr().(*net.TCPAddr).Port)
+		previous[f.Guest] = f.Host
+		got = append(got, f)
+		listeners = append(listeners, l)
+	}
+	if data, err := json.Marshal(previous); err == nil {
+		_ = fsutil.WriteFileAtomic(p.status+".ports", data, 0o600)
+	}
+	return got, func() {
+		for _, l := range listeners {
+			l.Close()
+		}
+	}
+}
+
+// secret returns the workspace's service password, creating it once.
+func secret(path string) (string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		s := strings.TrimSpace(string(data))
+		if len(s) == 64 {
+			if _, err := hex.DecodeString(s); err == nil {
+				return s, nil
+			}
+		}
+		return "", fmt.Errorf("%s is corrupt; delete it to make a new password", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	s := hex.EncodeToString(b)
+	return s, fsutil.WriteFileAtomic(path, []byte(s+"\n"), 0o600)
+}
+
+// ensureDisk creates a sparse disk image of size bytes if none exists.
+func ensureDisk(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", path)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
+}
+
+// macFor derives a stable, locally administered MAC address for a
+// workspace.
+func macFor(id string) net.HardwareAddr {
+	sum := sha256.Sum256([]byte("skerry-mac:" + id))
+	mac := net.HardwareAddr(sum[:6])
+	mac[0] = mac[0]&0xfc | 0x02 // unicast, locally administered
+	return mac
 }

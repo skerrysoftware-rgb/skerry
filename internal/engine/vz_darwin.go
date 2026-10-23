@@ -16,10 +16,12 @@ import (
 // VM is a running guest on Apple's Virtualization framework. The framework
 // runs the guest in its own sandboxed process, which also serves virtio-fs.
 type VM struct {
-	vm   *vz.VirtualMachine
-	done chan struct{}
-	once sync.Once
-	err  error
+	vm *vz.VirtualMachine
+	// network keeps the VM's end of the frame socket alive while it runs.
+	network *os.File
+	done    chan struct{}
+	once    sync.Once
+	err     error
 }
 
 // Start boots a VM.
@@ -87,6 +89,38 @@ func Start(cfg Config) (*VM, error) {
 	}
 	vcfg.SetDirectorySharingDevicesVirtualMachineConfiguration(fsDevices)
 
+	if cfg.Network != nil {
+		attach, err := vz.NewFileHandleNetworkDeviceAttachment(cfg.Network)
+		if err != nil {
+			return nil, fmt.Errorf("network: %w", err)
+		}
+		nic, err := vz.NewVirtioNetworkDeviceConfiguration(attach)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.MAC != nil {
+			mac, err := vz.NewMACAddress(cfg.MAC)
+			if err != nil {
+				return nil, err
+			}
+			nic.SetMACAddress(mac)
+		}
+		vcfg.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nic})
+	}
+	if cfg.DataDisk != "" {
+		// Fsync keeps what the guest flushed safe across a host crash.
+		attach, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(cfg.DataDisk, false,
+			vz.DiskImageCachingModeAutomatic, vz.DiskImageSynchronizationModeFsync)
+		if err != nil {
+			return nil, fmt.Errorf("data disk: %w", err)
+		}
+		disk, err := vz.NewVirtioBlockDeviceConfiguration(attach)
+		if err != nil {
+			return nil, err
+		}
+		vcfg.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{disk})
+	}
+
 	if ok, err := vcfg.Validate(); !ok || err != nil {
 		return nil, fmt.Errorf("VM configuration: %w", err)
 	}
@@ -94,7 +128,7 @@ func Start(cfg Config) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	v := &VM{vm: vm, done: make(chan struct{})}
+	v := &VM{vm: vm, network: cfg.Network, done: make(chan struct{})}
 	go v.watch()
 	if err := vm.Start(); err != nil {
 		return nil, fmt.Errorf("start VM: %w", err)
@@ -118,6 +152,9 @@ func (v *VM) watch() {
 func (v *VM) finish(err error) {
 	v.once.Do(func() {
 		v.err = err
+		if v.network != nil {
+			_ = v.network.Close()
+		}
 		close(v.done)
 	})
 }

@@ -297,3 +297,35 @@ func TestConcurrentEnsureKeysAgree(t *testing.T) {
 		}
 	}
 }
+
+func TestDialGuestLoopbackOnly(t *testing.T) {
+	c, _ := pair(t)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err == nil {
+			conn.Write([]byte("from a localhost-only server\n"))
+			conn.Close()
+		}
+	}()
+	conn, err := c.DialGuest(uint16(l.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(conn)
+	conn.Close()
+	if string(got) != "from a localhost-only server\n" {
+		t.Errorf("read %q", got)
+	}
+	// The agent is not a proxy to anywhere else.
+	for _, addr := range []string{"10.0.0.1:80", "93.184.216.34:443", "169.254.169.254:80"} {
+		if conn, err := c.conn.Dial("tcp", addr); err == nil {
+			conn.Close()
+			t.Errorf("agent dialed %s", addr)
+		}
+	}
+}

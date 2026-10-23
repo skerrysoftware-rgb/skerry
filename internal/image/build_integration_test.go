@@ -14,7 +14,11 @@ func TestBuildFromAlpine(t *testing.T) {
 	if os.Getenv("SKERRY_INTEGRATION") != "1" {
 		t.Skip("set SKERRY_INTEGRATION=1 to build from Alpine's mirror")
 	}
-	keys, err := TrustedKeys()
+	system, err := Wolfi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernelSrc, err := Alpine()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,15 +29,15 @@ func TestBuildFromAlpine(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "images"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	b := &Builder{Dir: dir, Keys: keys, Arch: "aarch64", Log: t.Logf}
+	b := &Builder{Dir: dir, System: system, Kernel: kernelSrc, Arch: "aarch64", Log: t.Logf}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	img, err := b.Build(ctx, Spec{Packages: []string{"nodejs"}, Agent: []byte("#!/bin/sh\n")})
+	img, err := b.Build(ctx, Spec{Packages: []string{"nodejs-24", "postgresql-17", "pgvector-17", "valkey", "temporal"}, Agent: []byte("#!/bin/sh\n")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"bin/busybox", "usr/bin/node", "etc/ssl/certs/ca-certificates.crt", ".skerry/agent"} {
+	for _, p := range []string{"usr/bin/busybox", "usr/bin/node", "usr/bin/postgres", "usr/bin/valkey-server", "usr/bin/temporal", "usr/sbin/mkfs.ext4", ".skerry/agent"} {
 		if _, err := os.Lstat(filepath.Join(img.Rootfs, p)); err != nil {
 			t.Errorf("rootfs is missing %s: %v", p, err)
 		}
@@ -49,7 +53,7 @@ func TestBuildFromAlpine(t *testing.T) {
 	t.Logf("image %s: %d install scripts", img.ID[:12], len(scripts))
 
 	// A second build reuses the image.
-	again, err := b.Build(ctx, Spec{Packages: []string{"nodejs"}, Agent: []byte("#!/bin/sh\n")})
+	again, err := b.Build(ctx, Spec{Packages: []string{"nodejs-24", "postgresql-17", "pgvector-17", "valkey", "temporal"}, Agent: []byte("#!/bin/sh\n")})
 	if err != nil || again.Dir != img.Dir {
 		t.Errorf("rebuild = %s, %v; want reuse of %s", again.Dir, err, img.Dir)
 	}

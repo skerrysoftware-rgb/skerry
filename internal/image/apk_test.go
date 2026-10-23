@@ -298,12 +298,12 @@ func TestStaleIndexUsedWhenOffline(t *testing.T) {
 	f := newFixture(t)
 	body := gzTar(t, tarEntry{name: "APKINDEX", body: "P:a\nV:1-r0\nC:Q1x\nS:1\n"})
 	signed := append(f.sign(t, body), body...)
-	dir := t.TempDir()
-	b := &Builder{Dir: dir, Keys: f.keys, Arch: "aarch64",
+	src := Source{Name: "test", Repos: []string{"https://example.invalid/os"}, Keys: f.keys}
+	b := &Builder{Dir: t.TempDir(), Arch: "aarch64",
 		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("offline")
 		})}}
-	cached := filepath.Join(b.repoDir("main"), "APKINDEX.tar.gz")
+	cached := filepath.Join(b.repoDir(src, src.Repos[0]), "APKINDEX.tar.gz")
 	if err := os.MkdirAll(filepath.Dir(cached), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -313,18 +313,122 @@ func TestStaleIndexUsedWhenOffline(t *testing.T) {
 	old := time.Now().Add(-72 * time.Hour)
 	os.Chtimes(cached, old, old)
 
-	text, err := b.index(context.Background(), "main")
+	text, err := b.index(context.Background(), src, src.Repos[0])
 	if err != nil || !strings.Contains(text, "P:a") {
 		t.Fatalf("offline with a stale cached index: %q, %v", text, err)
 	}
 	// A cached index that doesn't verify is never used.
 	os.WriteFile(cached, body, 0o644)
 	os.Chtimes(cached, old, old)
-	if _, err := b.index(context.Background(), "main"); err == nil {
+	if _, err := b.index(context.Background(), src, src.Repos[0]); err == nil {
 		t.Fatal("used an unsigned cached index")
+	}
+}
+
+func TestEachSourceHasPinnedKeys(t *testing.T) {
+	for _, name := range []string{"alpine", "wolfi"} {
+		keys, err := TrustedKeys(name)
+		if err != nil || len(keys) == 0 {
+			t.Errorf("TrustedKeys(%s) = %d keys, %v", name, len(keys), err)
+		}
+	}
+	if _, err := TrustedKeys("other"); err == nil {
+		t.Error("keys for an unknown source")
 	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCompareVersions(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want int
+	}{
+		{"1.0-r0", "1.0-r0", 0},
+		{"24.22.1-r2", "24.22.1-r10", -1},
+		{"24.9.0-r0", "24.22.1-r0", -1},
+		{"2.43-r13", "2.42-r20", 1},
+		{"1.0_rc1-r0", "1.0-r0", -1},
+		{"1.0_alpha2-r0", "1.0_beta1-r0", -1},
+		{"1.0_p1-r0", "1.0-r0", 1},
+		{"3.13.16_git20261016-r2", "3.13.16-r2", 1},
+		{"1.2.3a-r0", "1.2.3-r0", 1},
+		{"20230201-r30", "20230201-r9", 1},
+		{"1.10-r0", "1.9-r0", 1},
+	} {
+		if got := CompareVersions(tc.a, tc.b); got != tc.want {
+			t.Errorf("CompareVersions(%s, %s) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+		if got := CompareVersions(tc.b, tc.a); got != -tc.want {
+			t.Errorf("CompareVersions(%s, %s) = %d, want %d", tc.b, tc.a, got, -tc.want)
+		}
+	}
+}
+
+func TestResolverPicksNewest(t *testing.T) {
+	pkgs, err := ParseIndex(strings.Join([]string{
+		"P:nodejs-24\nV:24.9.0-r0\nC:Q1a\nS:1\np:cmd:node",
+		"P:nodejs-24\nV:24.22.1-r2\nC:Q1b\nS:1\np:cmd:node",
+		"P:nodejs-24\nV:24.22.1-r1\nC:Q1c\nS:1\np:cmd:node",
+	}, "\n\n"), "wolfi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewResolver(pkgs)
+	for _, name := range []string{"nodejs-24", "cmd:node"} {
+		order, err := r.Resolve([]string{name})
+		if err != nil || len(order) != 1 || order[0].Version != "24.22.1-r2" {
+			t.Errorf("Resolve(%s) = %+v, %v; want 24.22.1-r2", name, order, err)
+		}
+	}
+}
+
+// Wolfi moves to a new glibc through a package that provides "glibc" at a
+// higher version. Only one glibc may be installed, and a runtime asked for
+// by name must not be replaced by a newer one another package would pull.
+func TestResolverPicksOneProvider(t *testing.T) {
+	pkgs, err := ParseIndex(strings.Join([]string{
+		"P:glibc\nV:2.43-r13\nC:Q1a\nS:1\np:so:libc.so.6=6 so:libm.so.6=6",
+		"P:glibc-2.44\nV:2.44-r9\nC:Q1b\nS:1\nk:244\np:glibc=2.44-r9 so:libc.so.6=6 so:libm.so.6=6",
+		"P:nodejs-24\nV:24.22.1-r2\nC:Q1c\nS:1\nD:so:libm.so.6\np:nodejs=24.22.1-r2 cmd:node",
+		"P:nodejs-26\nV:26.12.1-r2\nC:Q1d\nS:1\nD:so:libm.so.6\np:nodejs=26.12.1-r2 cmd:node",
+		"P:npm\nV:12.0.2-r0\nC:Q1e\nS:1\nD:nodejs so:libc.so.6",
+	}, "\n\n"), "wolfi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := NewResolver(pkgs).Resolve([]string{"glibc", "nodejs-24", "npm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range order {
+		got = append(got, p.Name)
+	}
+	if strings.Join(got, " ") != "glibc-2.44 nodejs-24 npm" {
+		t.Errorf("installed %v; want glibc-2.44 nodejs-24 npm", got)
+	}
+}
+
+// Wolfi packages carry no per-package signature; the signed index's control
+// hash still pins them.
+func TestUnsignedPackageVerifiedThroughIndex(t *testing.T) {
+	f := newFixture(t)
+	data := gzTar(t, tarEntry{name: "usr/bin/x", body: "x"})
+	sum := sha256.Sum256(data)
+	control := gzTar(t, tarEntry{name: ".PKGINFO", body: "datahash = " + hex.EncodeToString(sum[:]) + "\n"})
+	blob := append(append([]byte{}, control...), data...)
+	csum := sha1.Sum(control) //nolint:gosec // format-mandated
+	pkg := Package{Name: "x", Version: "1-r0", Size: int64(len(blob)), Checksum: "Q1" + base64.StdEncoding.EncodeToString(csum[:])}
+	if _, err := VerifyPackage(f.keys, pkg, blob); err != nil {
+		t.Fatalf("unsigned package with a matching index entry: %v", err)
+	}
+	evil := gzTar(t, tarEntry{name: "usr/bin/x", body: "evil"})
+	tampered := append(append([]byte{}, control...), evil...)
+	pkg.Size = int64(len(tampered))
+	if _, err := VerifyPackage(f.keys, pkg, tampered); err == nil {
+		t.Fatal("accepted swapped data in an unsigned package")
+	}
+}

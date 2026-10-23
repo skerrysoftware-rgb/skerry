@@ -6,16 +6,24 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/agent"
 	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
+	"github.com/skerrysoftware-rgb/skerry/internal/project"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
 	"github.com/skerrysoftware-rgb/skerry/internal/shim"
+	"github.com/skerrysoftware-rgb/skerry/internal/termsafe"
 	"github.com/skerrysoftware-rgb/skerry/internal/vmm"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
@@ -185,15 +193,17 @@ func runInWorkspace(ctx context.Context, ws registry.Workspace, args []string, e
 // reportPlanted checks the checkout for files the VM may have planted for
 // host tools, quarantines them, and tells the user.
 func reportPlanted(ctx context.Context, ws registry.Workspace, env Env) {
+	// Paths and .git contents are the VM's to choose: strip anything that
+	// would act on the terminal.
 	if err := guard.CheckPointer(ws); err != nil {
-		fmt.Fprintf(env.Stderr, "skerry: WARNING: %v. Don't run git in %s until you've checked it.\n", err, ws.Path)
+		fmt.Fprintf(env.Stderr, "skerry: WARNING: %s. Don't run git in %s until you've checked it.\n", termsafe.Clean(err.Error()), ws.Path)
 	}
 	found, err := guard.Scan(ctx, ws)
 	for _, f := range found {
-		fmt.Fprintf(env.Stderr, "skerry: WARNING: found %s\n", f)
+		fmt.Fprintf(env.Stderr, "skerry: WARNING: found %s\n", termsafe.Clean(f.String()))
 	}
 	if err != nil {
-		fmt.Fprintf(env.Stderr, "skerry: checking %s for planted files: %v\n", ws.Path, err)
+		fmt.Fprintf(env.Stderr, "skerry: checking %s for planted files: %s\n", ws.Path, termsafe.Clean(err.Error()))
 	}
 }
 
@@ -287,4 +297,230 @@ func execReal(name string, args []string) error {
 		return syscall.Exec(candidate, append([]string{name}, args...), os.Environ())
 	}
 	return fmt.Errorf("%s: command not found", name)
+}
+
+// cmdStatus shows a workspace's VM, services and forwarded ports.
+func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	pos, err := parse(flag.NewFlagSet("status", flag.ContinueOnError), args)
+	if err != nil {
+		return err
+	}
+	ws, err := resolveWorkspace(ctx, m, pos, env)
+	if err != nil {
+		return err
+	}
+	if ws.Mode != registry.ModeSkerry {
+		fmt.Fprintf(env.Stdout, "%s is a plain worktree (no VM)\n", ws.Name)
+		return nil
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	if !v.Running(ws) {
+		proj, err := project.Load(ws.Path)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(env.Stdout, "%s is stopped\n", ws.Name)
+		if len(proj.Services) > 0 {
+			fmt.Fprintf(env.Stdout, "services when started: %s (%s)\n", strings.Join(proj.Services, ", "), proj.Source)
+		}
+		return nil
+	}
+	st, _, err := v.Status(ws)
+	if err != nil {
+		return fmt.Errorf("%s is running, but its status is unavailable: %w", ws.Name, err)
+	}
+	fmt.Fprintf(env.Stdout, "%s is running\n", ws.Name)
+	if len(st.Services) > 0 {
+		fmt.Fprintf(env.Stdout, "services: %s (%s)\n", strings.Join(st.Services, ", "), st.Source)
+	}
+	if len(st.Forwards) > 0 {
+		tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "\nPORT\tIN VM\tON THIS MAC")
+		for _, f := range st.Forwards {
+			where := fmt.Sprintf("127.0.0.1:%d", f.Host)
+			if f.Web {
+				where = services.HostURL(f.Name, st.Hostname, f.Host, "", true)
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\n", f.Name, f.Guest, where)
+		}
+		tw.Flush()
+		var vars []string
+		for k := range services.Env(st.Services, "") {
+			if strings.HasSuffix(k, "_URL") && k != "VALKEY_URL" || strings.HasSuffix(k, "_ADDRESS") {
+				vars = append(vars, k)
+			}
+		}
+		sort.Strings(vars)
+		fmt.Fprintf(env.Stdout, "\nCommands in the VM reach services through %s.\n", strings.Join(vars, ", "))
+		fmt.Fprintln(env.Stdout, "For a URL that works from this Mac, password included, run: skerry url <service>")
+	}
+	if slices.Contains(st.Services, "temporal") && !slices.ContainsFunc(st.Forwards, func(f vmm.Forward) bool { return f.Name == "temporal-ui" }) {
+		fmt.Fprintln(env.Stdout, "\nThe Temporal UI has no password, so it isn't forwarded; to see it, add 8233 to ports in skerry.yaml.")
+	}
+	return nil
+}
+
+// cmdURL prints the URL a host tool uses to reach a workspace service,
+// password included: psql "$(skerry url postgres)".
+func cmdURL(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("url", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("%w: url needs a service (postgres, valkey, temporal-ui) or a forwarded port", errUsage)
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	if !v.Running(ws) {
+		return fmt.Errorf("%s is stopped; start it with: skerry up %s", ws.Name, ws.Name)
+	}
+	st, secret, err := v.Status(ws)
+	if err != nil {
+		return err
+	}
+	want := pos[0]
+	if p, ok := services.Lookup(want); ok {
+		want = p.Ports[0].Name
+	}
+	for _, f := range st.Forwards {
+		if f.Name == want || strconv.Itoa(int(f.Guest)) == want {
+			fmt.Fprintln(env.Stdout, services.HostURL(f.Name, st.Hostname, f.Host, secret, f.Web))
+			return nil
+		}
+	}
+	return fmt.Errorf("%s does not run %s", ws.Name, pos[0])
+}
+
+// cmdLogs shows a service's log from the VM, or the VM's console or
+// refused network connections from the host.
+func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	follow := fs.Bool("f", false, "keep printing new lines")
+	lines := fs.Int("n", 100, "number of lines")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || *lines < 1 {
+		return fmt.Errorf("%w: logs needs one of: %s, console, network", errUsage, strings.Join(services.Names(), ", "))
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	tail := []string{"tail", "-n", strconv.Itoa(*lines)}
+	if *follow {
+		tail = append(tail, "-F") // logs are rotated by renaming
+	}
+	switch pos[0] {
+	case "console", "network":
+		// Host-side logs; tail runs on this Mac.
+		cmd := exec.CommandContext(ctx, "/usr/bin/tail", append(tail[1:], filepath.Join(v.StateDir(ws), pos[0]+".log"))...)
+		cmd.Stdout, cmd.Stderr = &termsafe.Writer{W: env.Stdout}, &termsafe.Writer{W: env.Stderr}
+		return cmd.Run()
+	}
+	p, ok := services.Lookup(pos[0])
+	if !ok {
+		return fmt.Errorf("%w: unknown log %q", errUsage, pos[0])
+	}
+	if !v.Running(ws) {
+		return fmt.Errorf("%s is stopped; service logs live in the VM", ws.Name)
+	}
+	c, err := v.Connect(ws)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	code, err := c.Run(ctx, agent.Cmd{
+		Args:   append(tail, "/var/log/skerry/"+p.Name+".log"),
+		Stdout: &termsafe.Writer{W: env.Stdout}, Stderr: &termsafe.Writer{W: env.Stderr},
+	})
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return exitCode(code)
+	}
+	return nil
+}
+
+// cmdReset deletes a workspace's service data, so its services start empty
+// at the next start.
+func cmdReset(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "don't ask for confirmation")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	ws, err := resolveWorkspace(ctx, m, pos, env)
+	if err != nil {
+		return err
+	}
+	if err := confirm(env, *yes, fmt.Sprintf("Delete all service data (databases, queues, workflow history) in workspace %s?", ws.Name)); err != nil {
+		return err
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	if err := v.Down(ws); err != nil {
+		return err
+	}
+	if err := v.ResetData(ws); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "%s's service data is deleted; services start empty at the next start\n", ws.Name)
+	return nil
+}
+
+// cmdGC deletes cached images and packages that nothing needs.
+func cmdGC(m *workspace.Manager, args []string, env Env) error {
+	if len(args) > 0 {
+		return fmt.Errorf("%w: gc takes no arguments", errUsage)
+	}
+	all, err := m.Registry.List()
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	removed, err := v.Collect(all)
+	images, packages := 0, 0
+	for _, r := range removed {
+		if strings.HasPrefix(r, "image ") {
+			images++
+		} else {
+			packages++
+		}
+	}
+	fmt.Fprintf(env.Stdout, "deleted %d images and %d downloaded packages\n", images, packages)
+	return err
 }

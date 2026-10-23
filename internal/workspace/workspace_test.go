@@ -222,6 +222,31 @@ func TestBaseIsRemoteDefaultBranch(t *testing.T) {
 	}
 }
 
+func TestCreateFromNamedBase(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	testutil.Git(t, root, "checkout", "--quiet", "-b", "feature")
+	testutil.WriteFile(t, filepath.Join(root, "feature.txt"), "feature\n")
+	testutil.Git(t, root, "add", "feature.txt")
+	testutil.Git(t, root, "commit", "--quiet", "-m", "feature")
+	feature := testutil.Git(t, root, "rev-parse", "HEAD")
+	testutil.Git(t, root, "checkout", "--quiet", "-")
+
+	m := newManager(t)
+	ws, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "on-feature", Base: "feature"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Base != feature {
+		t.Errorf("base = %s, want feature %s", ws.Base, feature)
+	}
+	for _, bad := range []string{"--output=/tmp/x", "no-such-branch"} {
+		if _, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "bad", Base: bad}); err == nil {
+			t.Errorf("base %q accepted", bad)
+		}
+	}
+}
+
 func TestWorktreeIncludeCopiesIgnoredFilesOnly(t *testing.T) {
 	ctx := context.Background()
 	root := testutil.NewRepo(t)

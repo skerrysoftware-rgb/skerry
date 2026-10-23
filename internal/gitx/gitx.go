@@ -192,6 +192,14 @@ func (g Git) Head(ctx context.Context, dir string) (string, error) {
 	return g.run(ctx, dir, "rev-parse", "--verify", "HEAD^{commit}")
 }
 
+// Commit resolves ref (a branch, tag or commit) to a commit id.
+func (g Git) Commit(ctx context.Context, dir, ref string) (string, error) {
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return "", fmt.Errorf("invalid ref %q", ref)
+	}
+	return g.run(ctx, dir, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+}
+
 // AbsoluteGitDir returns the git directory for the checkout at dir.
 func (g Git) AbsoluteGitDir(ctx context.Context, dir string) (string, error) {
 	return g.run(ctx, dir, "rev-parse", "--absolute-git-dir")

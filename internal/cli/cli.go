@@ -22,6 +22,7 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 	"github.com/skerrysoftware-rgb/skerry/internal/shim"
+	"github.com/skerrysoftware-rgb/skerry/internal/termsafe"
 	"github.com/skerrysoftware-rgb/skerry/internal/vmm"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
@@ -49,11 +50,17 @@ var errUsage = errors.New("usage")
 const usage = `skerry: an isolated environment for every checkout
 
 Usage:
-  skerry create <name> [--from DIR]   create a workspace and print its path
+  skerry create <name> [--from DIR] [--base BRANCH]
+                                      create a workspace and print its path
   skerry ls                           list workspaces
   skerry rm <name> [--force]          remove a workspace
   skerry up [name]                    start a workspace's VM
   skerry down [name]                  stop it
+  skerry status [name]                show its services and forwarded ports
+  skerry url [-w name] SERVICE        print a URL for a service, for tools on this Mac
+  skerry logs [-w name] [-f] [-n N] SERVICE|console|network
+  skerry reset [name] [--yes]         delete the workspace's service data
+  skerry gc                           delete images and downloads no workspace needs
   skerry exec [-w name] -- CMD...     run a command inside the workspace VM
   skerry enable [DIR] [--yes]         use skerry for checkouts under DIR
   skerry disable [DIR]                stop using skerry under DIR
@@ -78,7 +85,8 @@ func Main(ctx context.Context, args []string, env Env) int {
 		fmt.Fprintf(env.Stderr, "skerry: %v\n\n%s", err, usage)
 		return 2
 	default:
-		fmt.Fprintf(env.Stderr, "skerry: %v\n", err)
+		// Errors can quote repository files or VM output.
+		fmt.Fprintf(env.Stderr, "skerry: %s\n", termsafe.Clean(err.Error()))
 		return 1
 	}
 }
@@ -121,6 +129,16 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdDown(ctx, m, rest, env)
 	case "exec":
 		return cmdExec(ctx, m, rest, env)
+	case "status":
+		return cmdStatus(ctx, m, rest, env)
+	case "url":
+		return cmdURL(ctx, m, rest, env)
+	case "logs":
+		return cmdLogs(ctx, m, rest, env)
+	case "reset":
+		return cmdReset(ctx, m, rest, env)
+	case "gc":
+		return cmdGC(m, rest, env)
 	case "vm":
 		return cmdVM(ctx, m, rest, env)
 	case "claude":
@@ -160,7 +178,12 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 		if err := fs.Parse(args); err != nil {
 			return nil, fmt.Errorf("%w: %v", errUsage, err)
 		}
-		args = fs.Args()
+		rest := fs.Args()
+		// After "--", everything is positional.
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			return append(positional, rest...), nil
+		}
+		args = rest
 		if len(args) == 0 {
 			return positional, nil
 		}
@@ -172,6 +195,7 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 func cmdCreate(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	from := fs.String("from", "", "directory in the repository to start from")
+	base := fs.String("base", "", "branch or commit to start the workspace from (default: the default branch)")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
@@ -185,7 +209,7 @@ func cmdCreate(ctx context.Context, m *workspace.Manager, args []string, env Env
 			return err
 		}
 	}
-	ws, err := m.Create(ctx, workspace.CreateOptions{From: start, Name: pos[0], CreatedBy: "cli"})
+	ws, err := m.Create(ctx, workspace.CreateOptions{From: start, Name: pos[0], CreatedBy: "cli", Base: *base})
 	if err != nil {
 		return err
 	}

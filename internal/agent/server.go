@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -51,7 +52,10 @@ type Server struct {
 	Shell string
 	// Poweroff is called for a poweroff request; nil refuses the request.
 	Poweroff func()
-	Log      *log.Logger
+	// Env is added to every command's environment; the client's variables
+	// win over it, and baseEnv wins over both.
+	Env map[string]string
+	Log *log.Logger
 }
 
 // NewServer builds a server that accepts only authorizedKey.
@@ -94,16 +98,75 @@ func (s *Server) ServeConn(conn net.Conn) {
 	defer sconn.Close()
 	go s.globalRequests(reqs)
 	for nc := range chans {
-		if nc.ChannelType() != "session" {
-			_ = nc.Reject(ssh.UnknownChannelType, "only session channels")
-			continue
+		switch nc.ChannelType() {
+		case "session":
+			ch, chReqs, err := nc.Accept()
+			if err != nil {
+				continue
+			}
+			go s.session(ch, chReqs)
+		case "direct-tcpip":
+			go s.directTCPIP(nc)
+		default:
+			_ = nc.Reject(ssh.UnknownChannelType, "only session and direct-tcpip channels")
 		}
-		ch, chReqs, err := nc.Accept()
-		if err != nil {
-			continue
-		}
-		go s.session(ch, chReqs)
 	}
+}
+
+// directTCPIP connects the host to a port on the guest's loopback
+// interface: that is how skerry forwards ports, so servers that listen
+// only on localhost in the VM are reachable too. Nothing else can be
+// dialed through it.
+func (s *Server) directTCPIP(nc ssh.NewChannel) {
+	var p struct {
+		Host     string
+		Port     uint32
+		OrigHost string
+		OrigPort uint32
+	}
+	if err := ssh.Unmarshal(nc.ExtraData(), &p); err != nil {
+		_ = nc.Reject(ssh.ConnectionFailed, "bad request")
+		return
+	}
+	host := ""
+	switch p.Host {
+	case "127.0.0.1", "localhost":
+		host = "127.0.0.1"
+	case "::1":
+		host = "::1"
+	}
+	if host == "" || p.Port == 0 || p.Port > 65535 {
+		_ = nc.Reject(ssh.Prohibited, "only ports on the guest's loopback interface")
+		return
+	}
+	out, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(p.Port))), 5*time.Second)
+	if err != nil {
+		_ = nc.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := nc.Accept()
+	if err != nil {
+		out.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(out, ch)
+		if tc, ok := out.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(ch, out)
+		_ = ch.CloseWrite()
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+	ch.Close()
+	out.Close()
 }
 
 func (s *Server) globalRequests(reqs <-chan *ssh.Request) {
@@ -224,6 +287,9 @@ func (s *Server) start(command string, clientEnv map[string]string, ch ssh.Chann
 		cmd.Dir = filepath.Clean(cwd)
 	}
 	env := map[string]string{}
+	for k, v := range s.Env {
+		env[k] = v
+	}
 	for k, v := range clientEnv {
 		env[k] = v
 	}

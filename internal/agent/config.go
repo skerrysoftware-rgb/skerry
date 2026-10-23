@@ -11,9 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
 )
 
 // Port is the vsock port the agent's SSH server listens on.
@@ -49,7 +53,25 @@ type Config struct {
 	// checkout at the same path, so paths mean the same thing on both sides.
 	WorkspacePath string `json:"workspace_path,omitempty"`
 	Hostname      string `json:"hostname,omitempty"`
+	// Network configures the VM's network card; nil leaves it down.
+	Network *Network `json:"network,omitempty"`
+	// DataDisk says the VM has a persistent disk for service data. The
+	// agent formats it on first boot if, and only if, it is blank.
+	DataDisk bool `json:"data_disk,omitempty"`
+	// Services are preset names the agent runs and supervises.
+	Services []string `json:"services,omitempty"`
+	// Secret is the workspace's password for its services.
+	Secret string `json:"secret,omitempty"`
 }
+
+// Network is the guest side of the workspace network.
+type Network struct {
+	Address netip.Prefix `json:"address"`
+	Gateway netip.Addr   `json:"gateway"`
+	DNS     netip.Addr   `json:"dns"`
+}
+
+var secretPattern = regexp.MustCompile(`^[0-9a-f]{32,64}$`)
 
 var hostnamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
@@ -72,6 +94,26 @@ func (c Config) Validate() error {
 	}
 	if c.Hostname != "" && !hostnamePattern.MatchString(c.Hostname) {
 		return fmt.Errorf("invalid hostname %q", c.Hostname)
+	}
+	if n := c.Network; n != nil {
+		if !n.Address.IsValid() || !n.Address.Addr().Is4() || !n.Gateway.Is4() || !n.DNS.Is4() || !n.Address.Contains(n.Gateway) {
+			return fmt.Errorf("invalid network %+v", *n)
+		}
+	}
+	if len(c.Services) > 0 {
+		norm, err := services.Normalize(c.Services)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(norm, c.Services) {
+			return fmt.Errorf("services %v are not normalized", c.Services)
+		}
+		if !c.DataDisk {
+			return errors.New("services need a data disk")
+		}
+		if !secretPattern.MatchString(c.Secret) {
+			return errors.New("services need a secret of 32 to 64 hex digits")
+		}
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -39,22 +40,56 @@ func NewClient(conn net.Conn, keys Keys) (*Client, error) {
 // Close closes the connection.
 func (c *Client) Close() error { return c.conn.Close() }
 
+// requestTimeout bounds waiting for the agent to answer a request or open
+// a channel. The guest is not trusted to answer at all.
+const requestTimeout = 10 * time.Second
+
+// bounded runs f, but gives up after requestTimeout and closes the
+// connection, which also ends f.
+func (c *Client) bounded(what string, f func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	t := time.NewTimer(requestTimeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		c.conn.Close()
+		return fmt.Errorf("the agent did not answer %s within %s", what, requestTimeout)
+	}
+}
+
 // Ping checks that the agent is answering.
 func (c *Client) Ping() error {
-	ok, _, err := c.conn.SendRequest(RequestPing, true, nil)
-	if err == nil && !ok {
-		err = errors.New("agent refused ping")
-	}
-	return err
+	return c.bounded("a ping", func() error {
+		ok, _, err := c.conn.SendRequest(RequestPing, true, nil)
+		if err == nil && !ok {
+			err = errors.New("agent refused ping")
+		}
+		return err
+	})
+}
+
+// DialGuest connects to a TCP port on the guest's loopback interface.
+func (c *Client) DialGuest(port uint16) (net.Conn, error) {
+	var conn net.Conn
+	err := c.bounded("a connection request", func() (err error) {
+		conn, err = c.conn.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
+		return err
+	})
+	return conn, err
 }
 
 // Poweroff asks the guest to shut down cleanly.
 func (c *Client) Poweroff() error {
-	ok, _, err := c.conn.SendRequest(RequestPoweroff, true, nil)
-	if err == nil && !ok {
-		err = errors.New("agent refused poweroff")
-	}
-	return err
+	return c.bounded("a poweroff request", func() error {
+		ok, _, err := c.conn.SendRequest(RequestPoweroff, true, nil)
+		if err == nil && !ok {
+			err = errors.New("agent refused poweroff")
+		}
+		return err
+	})
 }
 
 // Cmd is a command to run in the guest.

@@ -31,6 +31,9 @@ type Workspace struct {
 	Branch string `json:"branch"`
 	// Base is the commit the branch started from.
 	Base string `json:"base"`
+	// GitDir is the worktree's git directory inside the main repository,
+	// recorded at creation, before any VM could touch the checkout.
+	GitDir string `json:"git_dir,omitempty"`
 	// Mode is ModeSkerry for a full environment, or ModePlain for a plain
 	// worktree created where skerry isn't enabled.
 	Mode string `json:"mode"`

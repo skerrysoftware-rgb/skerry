@@ -20,6 +20,10 @@ import (
 type Git struct {
 	// Bin is the git executable; empty means "git" from PATH.
 	Bin string
+	// GitDir and WorkTree, when set, are passed explicitly, so git never
+	// discovers a repository from the working directory. Workspace commands
+	// use them: a VM can write into the checkout, including its .git entry.
+	GitDir, WorkTree string
 }
 
 // Error is a git command that ran and exited non-zero.
@@ -55,7 +59,11 @@ func (g Git) runInput(ctx context.Context, dir string, stdin []byte, args ...str
 	if bin == "" {
 		bin = "git"
 	}
-	cmd := exec.CommandContext(ctx, bin, append([]string{"-C", dir}, args...)...)
+	pre := []string{"-C", dir}
+	if g.GitDir != "" {
+		pre = append(pre, "--git-dir="+g.GitDir, "--work-tree="+g.WorkTree)
+	}
+	cmd := exec.CommandContext(ctx, bin, append(pre, args...)...)
 	cmd.Env = cleanEnv(os.Environ())
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
@@ -184,6 +192,31 @@ func (g Git) Head(ctx context.Context, dir string) (string, error) {
 	return g.run(ctx, dir, "rev-parse", "--verify", "HEAD^{commit}")
 }
 
+// AbsoluteGitDir returns the git directory for the checkout at dir.
+func (g Git) AbsoluteGitDir(ctx context.Context, dir string) (string, error) {
+	return g.run(ctx, dir, "rev-parse", "--absolute-git-dir")
+}
+
+// Untracked lists files under the given paths that git doesn't track,
+// including ignored ones, relative to the work tree.
+func (g Git) Untracked(ctx context.Context, dir string, paths ...string) ([]string, error) {
+	guard, err := g.guard(ctx, dir, false)
+	if err != nil {
+		return nil, err
+	}
+	out, err := g.runInput(ctx, dir, nil, append(append(guard, "ls-files", "-z", "--others", "--"), paths...)...)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, f := range strings.Split(out, "\x00") {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
 // TopLevel returns the top directory of the working tree containing dir.
 func (g Git) TopLevel(ctx context.Context, dir string) (string, error) {
 	return g.run(ctx, dir, "rev-parse", "--show-toplevel")
@@ -257,7 +290,11 @@ func (g Git) Dirty(ctx context.Context, path string) (bool, error) {
 
 // Unpushed counts commits made since base that no remote has.
 func (g Git) Unpushed(ctx context.Context, path, base string) (int, error) {
-	out, err := g.run(ctx, path, "rev-list", "--count", base+"..HEAD", "--not", "--remotes")
+	guard, err := g.guard(ctx, path, false)
+	if err != nil {
+		return 0, err
+	}
+	out, err := g.run(ctx, path, append(guard, "rev-list", "--count", base+"..HEAD", "--not", "--remotes")...)
 	if err != nil {
 		return 0, err
 	}

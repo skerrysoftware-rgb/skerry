@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 )
 
 // IsolateGit points git at an empty global config for the rest of the test,
@@ -35,6 +37,16 @@ func NewRepo(t *testing.T) string {
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Workspaces mark their .git pointer immutable; clear that so the
+	// temporary directory can be deleted.
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.Name() == ".git" {
+				_ = fsutil.SetImmutable(p, false)
+			}
+			return nil
+		})
+	})
 	Git(t, root, "init", "--quiet")
 	WriteFile(t, filepath.Join(root, "README.md"), "hello\n")
 	Git(t, root, "add", "README.md")

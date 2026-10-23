@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/workspace"
 )
@@ -165,6 +166,7 @@ func (h *Handler) sessionStart(in Input) error {
 		if h.StartVM != nil {
 			h.StartVM(ws) // boot in the background so the first command is quick
 		}
+		warnings := plantedWarnings(ws)
 		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s."+
 			" The workspace has its own lightweight Linux VM (Alpine), isolated from other workspaces:"+
 			" its own processes, ports and /tmp. The checkout is mounted at the same path inside the VM."+
@@ -172,7 +174,7 @@ func (h *Handler) sessionStart(in Input) error {
 			" every other command, git included, runs on the host as usual."+
 			" To run anything else inside the VM, use `skerry exec -- <command>`"+
 			" (for example `skerry exec -- sh -c 'ls /tmp'`). The VM has no network access yet.",
-			ws.Name, ws.Path, ws.Branch)
+			ws.Name, ws.Path, ws.Branch) + warnings
 	} else {
 		// A plain worktree: say once per repository that skerry is
 		// available, then stay out of the way.
@@ -219,4 +221,18 @@ func (h *Handler) getenv(name string) string {
 		return h.Getenv(name)
 	}
 	return os.Getenv(name)
+}
+
+// plantedWarnings checks the checkout for files a VM may have planted for
+// host tools, quarantines them, and returns text for Claude's context.
+func plantedWarnings(ws registry.Workspace) string {
+	var b strings.Builder
+	if err := guard.CheckPointer(ws); err != nil {
+		fmt.Fprintf(&b, " WARNING: %v. Do not run git in this worktree; tell the user.", err)
+	}
+	found, _ := guard.Scan(context.Background(), ws)
+	for _, f := range found {
+		fmt.Fprintf(&b, " WARNING: skerry found and quarantined %s. Tell the user; do not restore it without their review.", f)
+	}
+	return b.String()
 }

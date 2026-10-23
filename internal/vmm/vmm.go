@@ -26,6 +26,7 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/assets"
 	"github.com/skerrysoftware-rgb/skerry/internal/engine"
 	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
+	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/image"
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
@@ -254,6 +255,9 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	if err != nil {
 		return err
 	}
+	if err := guard.Protect(ws); err != nil {
+		return fmt.Errorf("protect %s/.git: %w", ws.Path, err)
+	}
 	// Written once, before boot, while nothing reads it.
 	cfg := agent.Config{Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name)}
 	if err := agent.WriteConfig(p.share, cfg); err != nil {
@@ -298,6 +302,11 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 			go proxy(conn, vm)
 		}
 	}()
+	// Code in the VM keeps running between commands (dev servers, watchers),
+	// so check for planted files on a timer too.
+	scanCtx, stopScan := context.WithCancel(ctx)
+	defer stopScan()
+	go watchCheckout(scanCtx, ws)
 
 	select {
 	case <-vm.Done():
@@ -539,4 +548,25 @@ func (m *Manager) Forget(ws registry.Workspace) error {
 		_ = os.Remove(p.socket)
 	}
 	return os.RemoveAll(m.StateDir(ws))
+}
+
+// watchCheckout scans the checkout for planted files every few seconds while
+// the VM runs, quarantining what it finds. Findings go to the runner log.
+func watchCheckout(ctx context.Context, ws registry.Workspace) {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := guard.CheckPointer(ws); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
+		}
+		found, _ := guard.Scan(ctx, ws)
+		for _, f := range found {
+			fmt.Fprintf(os.Stderr, "WARNING: found %s\n", f)
+		}
+	}
 }

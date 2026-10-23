@@ -16,6 +16,7 @@ import (
 
 	"github.com/skerrysoftware-rgb/skerry/internal/fsutil"
 	"github.com/skerrysoftware-rgb/skerry/internal/gitx"
+	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/scope"
 )
@@ -164,6 +165,11 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	if err := m.copyIncludes(ctx, root, path); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
+	// Record the git directory now, before any VM can touch the checkout.
+	gitDir, err := m.worktreeGitDir(ctx, root, path)
+	if err != nil {
+		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
+	}
 
 	id, err := newID()
 	if err != nil {
@@ -171,12 +177,33 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	}
 	ws := registry.Workspace{
 		ID: id, Name: o.Name, Repo: root, Path: path, Branch: branch, Base: base,
-		Mode: mode, CreatedBy: o.CreatedBy, CreatedAt: m.now().UTC(),
+		GitDir: gitDir, Mode: mode, CreatedBy: o.CreatedBy, CreatedAt: m.now().UTC(),
+	}
+	if mode == registry.ModeSkerry {
+		if err := guard.Protect(ws); err != nil {
+			return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
+		}
 	}
 	if err := m.Registry.Add(ws); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 	return ws, nil
+}
+
+// worktreeGitDir returns the worktree's git directory, which must sit in
+// the main repository's .git/worktrees.
+func (m *Manager) worktreeGitDir(ctx context.Context, root, path string) (string, error) {
+	dir, err := m.Git.AbsoluteGitDir(ctx, path)
+	if err == nil {
+		dir, err = Canonical(dir)
+	}
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(dir, filepath.Join(root, ".git", "worktrees")+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s has an unexpected git directory %s", path, dir)
+	}
+	return dir, nil
 }
 
 // copyIncludes copies the main checkout's .worktreeinclude files into a new
@@ -248,6 +275,7 @@ func copyFile(src, dst *os.Root, rel string, perm os.FileMode) error {
 // new, so everything removed here is this call's own.
 func (m *Manager) rollback(ctx context.Context, root, path, branch string, cause error) error {
 	errs := []error{cause}
+	_ = fsutil.SetImmutable(filepath.Join(path, ".git"), false)
 	if _, err := os.Lstat(path); err == nil {
 		if err := m.Git.RemoveWorktree(ctx, root, path, true); err != nil {
 			errs = append(errs, fmt.Errorf("rollback: %w", err))
@@ -294,13 +322,22 @@ func (m *Manager) adopt(ctx context.Context, root, path string, o CreateOptions)
 	if enabled {
 		mode = registry.ModeSkerry
 	}
+	gitDir, err := m.worktreeGitDir(ctx, root, path)
+	if err != nil {
+		return registry.Workspace{}, err
+	}
 	id, err := newID()
 	if err != nil {
 		return registry.Workspace{}, err
 	}
 	ws := registry.Workspace{
-		ID: id, Name: o.Name, Repo: root, Path: path, Branch: branch, Base: head,
+		ID: id, Name: o.Name, Repo: root, Path: path, Branch: branch, Base: head, GitDir: gitDir,
 		Mode: mode, CreatedBy: o.CreatedBy + " (adopted)", CreatedAt: m.now().UTC(),
+	}
+	if mode == registry.ModeSkerry {
+		if err := guard.Protect(ws); err != nil {
+			return registry.Workspace{}, err
+		}
 	}
 	return ws, m.Registry.Add(ws)
 }
@@ -327,6 +364,11 @@ func (m *Manager) Remove(ctx context.Context, ws registry.Workspace, force bool)
 
 	_, statErr := os.Lstat(ws.Path)
 	if statErr == nil && !force {
+		// A changed pointer means something rewrote git's own metadata,
+		// most likely code in the VM. Don't run git through it.
+		if err := guard.CheckPointer(ws); err != nil {
+			return RemoveResult{}, fmt.Errorf("%w; inspect %s, then remove it with: skerry rm --force %s", err, ws.Path, ws.Name)
+		}
 		if err := m.checkNoWork(ctx, ws); err != nil {
 			return RemoveResult{}, err
 		}
@@ -339,6 +381,9 @@ func (m *Manager) Remove(ctx context.Context, ws registry.Workspace, force bool)
 	}
 	switch {
 	case statErr == nil:
+		if err := guard.Unprotect(ws); err != nil {
+			return RemoveResult{}, err
+		}
 		if err := m.Git.RemoveWorktree(ctx, ws.Repo, ws.Path, force); err != nil {
 			return RemoveResult{}, err
 		}
@@ -375,11 +420,12 @@ func (m *Manager) Remove(ctx context.Context, ws registry.Workspace, force bool)
 }
 
 func (m *Manager) checkNoWork(ctx context.Context, ws registry.Workspace) error {
-	dirty, err := m.Git.Dirty(ctx, ws.Path)
+	git := guard.Git(ws) // never discover the repository through the checkout
+	dirty, err := git.Dirty(ctx, ws.Path)
 	if err != nil {
 		return err
 	}
-	unpushed, err := m.Git.Unpushed(ctx, ws.Path, ws.Base)
+	unpushed, err := git.Unpushed(ctx, ws.Path, ws.Base)
 	if err != nil {
 		return err
 	}

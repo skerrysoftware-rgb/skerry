@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/agent"
+	"github.com/skerrysoftware-rgb/skerry/internal/guard"
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
 	"github.com/skerrysoftware-rgb/skerry/internal/registry"
 	"github.com/skerrysoftware-rgb/skerry/internal/shim"
@@ -170,6 +171,7 @@ func runInWorkspace(ctx context.Context, ws registry.Workspace, args []string, e
 		Args: args, Dir: dir, Env: vars,
 		Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr, Signals: sigs,
 	})
+	reportPlanted(ctx, ws, env)
 	if err != nil {
 		return err
 	}
@@ -177,6 +179,21 @@ func runInWorkspace(ctx context.Context, ws registry.Workspace, args []string, e
 		return exitCode(code)
 	}
 	return nil
+}
+
+// reportPlanted checks the checkout for files the VM may have planted for
+// host tools, quarantines them, and tells the user.
+func reportPlanted(ctx context.Context, ws registry.Workspace, env Env) {
+	if err := guard.CheckPointer(ws); err != nil {
+		fmt.Fprintf(env.Stderr, "skerry: WARNING: %v. Don't run git in %s until you've checked it.\n", err, ws.Path)
+	}
+	found, err := guard.Scan(ctx, ws)
+	for _, f := range found {
+		fmt.Fprintf(env.Stderr, "skerry: WARNING: found %s\n", f)
+	}
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "skerry: checking %s for planted files: %v\n", ws.Path, err)
+	}
 }
 
 // cmdVM holds internal VM commands; `skerry vm run ID` is the runner.

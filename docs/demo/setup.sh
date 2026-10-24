@@ -26,11 +26,12 @@ git init --quiet -b main
 # Claude Code runs skerry's hooks from the project's settings. Inside a
 # worktree it reads the settings committed there, so they are committed.
 skerry claude install --settings "$repo/.claude/settings.json" --yes >/dev/null
-python3 -I - "$repo/.claude/settings.json" <<'EOF2'
+python3 -I - "$repo/.claude/settings.json" "$(command -v skerry)" <<'EOF2'
 import json, sys
 path = sys.argv[1]
 settings = json.load(open(path))
 settings["model"] = "haiku"
+settings["statusLine"] = {"type": "command", "command": sys.argv[2] + " statusline", "refreshInterval": 1}
 json.dump(settings, open(path, "w"), indent=2)
 EOF2
 git add -A
@@ -43,10 +44,4 @@ commit "gift notes on orders"
 git checkout --quiet main
 skerry enable "$repo" --yes >/dev/null
 
-# One workspace per branch. Dependencies are installed ahead of recording.
-skerry create checkout >/dev/null
-skerry create gifts --base gift-notes >/dev/null
-for ws in checkout gifts; do
-	(cd "$repo/.claude/worktrees/$ws" && skerry exec -- npm install --silent --no-audit --no-fund && skerry down >/dev/null)
-done
 echo "demo ready in $repo"

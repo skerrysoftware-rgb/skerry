@@ -34,6 +34,9 @@ var BootModules = []string{
 	"virtio_net", "virtio_blk", "ext4",
 }
 
+// maxImageDownload bounds the packages one image may need.
+const maxImageDownload = 3 << 30
+
 // formatVersion changes whenever the image layout changes, so old images
 // are rebuilt rather than misread.
 const formatVersion = "3"
@@ -95,6 +98,15 @@ func (b *Builder) Build(ctx context.Context, spec Spec) (Image, error) {
 	pkgs, err := system.Resolve(append(append([]string{}, BasePackages...), spec.Packages...))
 	if err != nil {
 		return Image{}, err
+	}
+	// A project chooses packages, so bound what it can make skerry fetch.
+	var total int64
+	for _, p := range pkgs {
+		total += p.Size
+	}
+	if total > maxImageDownload {
+		return Image{}, fmt.Errorf("the image would need %d MB of packages, more than the %d MB limit; ask for fewer packages",
+			total>>20, int64(maxImageDownload)>>20)
 	}
 	kernelSrc, err := b.resolver(ctx, b.Kernel)
 	if err != nil {

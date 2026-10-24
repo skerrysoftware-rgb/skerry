@@ -274,6 +274,26 @@ func runShim(ctx context.Context, name string, args []string, env Env) error {
 	case ws.Mode != registry.ModeSkerry:
 		return execReal(name, args)
 	}
+	// A runtime the workspace has never had isn't in its VM: run the
+	// machine's own, as without skerry. "Never had" counts skerry's own
+	// record too, so code in the VM can't move a runtime's commands onto
+	// the host by editing skerry.yaml.
+	if runtime, ok := services.RuntimeFor(name); ok && runtime != "node" {
+		v, err := newVMM(env, false)
+		if err != nil {
+			return err
+		}
+		recorded := slices.Contains(v.RecordedRuntimes(ws), runtime)
+		if !recorded {
+			proj, err := project.Load(ws.Path)
+			if err != nil {
+				return fmt.Errorf("%s: %w (set SKERRY_SHIMS=off to run %s on this machine)", ws.Path, err, name)
+			}
+			if !services.HasRuntime(proj.Runtimes, runtime) {
+				return execReal(name, args)
+			}
+		}
+	}
 	return runInWorkspace(ctx, ws, append([]string{name}, args...), env)
 }
 
@@ -319,6 +339,12 @@ func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env
 	v, err := newVMM(env, false)
 	if err != nil {
 		return err
+	}
+	switch pr := v.ReadProgress(ws); {
+	case pr.Busy():
+		fmt.Fprintf(env.Stdout, "%s is being prepared: %s\n", ws.Name, pr)
+	case pr.Phase == vmm.PhaseStartFailed:
+		fmt.Fprintf(env.Stdout, "%s failed to start: %s\n", ws.Name, termsafe.Clean(pr.Detail))
 	}
 	if !v.Running(ws) {
 		proj, err := project.Load(ws.Path)
@@ -757,7 +783,11 @@ func cmdStatusline(m *workspace.Manager, env Env) error {
 		return nil
 	}
 	line := "skerry " + ws.Name + ": "
-	if !v.Running(ws) {
+	if pr := v.ReadProgress(ws); pr.Busy() {
+		line += "preparing · " + pr.String()
+	} else if pr.Phase == vmm.PhaseStartFailed {
+		line += "failed to start · skerry status"
+	} else if !v.Running(ws) {
 		line += "stopped"
 	} else {
 		line += "running"

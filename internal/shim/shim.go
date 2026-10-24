@@ -8,10 +8,13 @@ import (
 	"path/filepath"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/paths"
+	"github.com/skerrysoftware-rgb/skerry/internal/services"
 )
 
-// Names are the commands that run inside the workspace VM.
-var Names = []string{"node", "npm", "npx", "corepack", "yarn", "pnpm"}
+// Names are the commands that can run inside the workspace VM: every
+// runtime's commands. Node's always do; another runtime's do only in
+// workspaces whose project has that runtime.
+var Names = services.AllRuntimeCommands()
 
 // Is reports whether skerry was invoked through a shim link.
 func Is(argv0 string) bool {

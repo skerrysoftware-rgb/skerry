@@ -173,12 +173,15 @@ func (h *Handler) sessionStart(in Input) error {
 		context = fmt.Sprintf("This session runs in skerry workspace %q at %s, on branch %s."+
 			" The workspace has its own lightweight Linux VM (Wolfi), isolated from other workspaces:"+
 			" its own processes, ports, /tmp and services. The checkout is mounted at the same path inside the VM."+
-			" `node`, `npm`, `npx`, `yarn`, `pnpm` and `corepack` run inside the VM automatically;"+
+			" %s run inside the VM automatically;"+
 			" every other command, git included, runs on the host as usual."+
 			" To run anything else inside the VM, use `skerry exec -- <command>`"+
 			" (for example `skerry exec -- sh -c 'ls /tmp'`)."+
-			" The VM can reach the public internet (package registries, APIs) but not this machine, its local network or cloud metadata.",
-			ws.Name, ws.Path, ws.Branch) + servicesContext(ws) + warnings
+			" The VM can reach the public internet (package registries, APIs) but not this machine, its local network or cloud metadata."+
+			" The workspace is being prepared in the background (its image, services and dependencies), which can take a few minutes the first time;"+
+			" this session isn't blocked by it: edit files and use git as usual. Commands that run in the VM wait for it and print each step,"+
+			" and `skerry status` shows where it is.",
+			ws.Name, ws.Path, ws.Branch, vmCommands(ws)) + servicesContext(ws) + warnings
 	} else {
 		// A plain worktree: say once per repository that skerry is
 		// available, then stay out of the way.
@@ -197,6 +200,25 @@ func (h *Handler) sessionStart(in Input) error {
 			"additionalContext": context,
 		},
 	})
+}
+
+// vmCommands lists, in backquotes, the commands that run in the VM for
+// the workspace's runtimes.
+func vmCommands(ws registry.Workspace) string {
+	choices := []services.RuntimeChoice{{Name: "node"}}
+	if proj, err := project.Load(ws.Path); err == nil {
+		choices = proj.Runtimes
+	}
+	var cmds []string
+	for _, c := range choices {
+		for _, cmd := range services.RuntimeCommands(c.Name) {
+			cmds = append(cmds, "`"+cmd+"`")
+		}
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return strings.Join(cmds[:len(cmds)-1], ", ") + " and " + cmds[len(cmds)-1]
 }
 
 // servicesContext tells Claude which services the workspace runs and how

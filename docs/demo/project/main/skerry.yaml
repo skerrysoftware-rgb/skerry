@@ -1,0 +1,5 @@
+# What every workspace of this project needs. Services (Postgres,
+# Temporal) are detected from package.json.
+setup:
+  - npm install --no-audit --no-fund
+  - npm run -s migrate

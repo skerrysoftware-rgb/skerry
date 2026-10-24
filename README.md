@@ -1,372 +1,240 @@
 # skerry
 
-**An isolated, lightweight Linux VM for every checkout: parallel work that
-can't collide, and code that can't reach your Mac.**
+**A lightweight Linux VM for every checkout, so parallel coding sessions
+can't collide, and the code they run can't reach your machine.**
 
-skerry is for developers who work on several branches at once, and for coding
-agents like Claude Code that run many sessions side by side. It does two
-things:
+Coding agents like Claude Code work best in parallel: several sessions, each
+in its own git worktree, each on its own task. Worktrees separate the files,
+but everything else is shared. Two sessions both want port 3000, one
+branch's migration breaks the other's database, and every command an agent
+runs has your whole machine within reach.
 
-- **Parallel work without collisions.** Each checkout (a git worktree) gets
-  its own small, fast VM with its own processes, ports, filesystem and
-  services: its own Postgres (with pgvector), Valkey (Redis) and Temporal,
-  with data that survives restarts. Two branches can run different
-  migrations against "the" database at the same time, and neither notices
-  the other.
-- **Isolation you can rely on.** Everything a workspace runs (dependency
-  install scripts, repository scripts, commands an AI agent decides to run)
-  runs inside the VM, not on your Mac. Code in a workspace:
-  - can't read files on your Mac outside its own checkout
-  - can reach the internet (package registries, APIs) but not your Mac,
-    your local network, other workspaces or cloud metadata
-  - can't modify the system image it runs from (shared read-only)
-  - can't redirect your git through the checkout: the worktree's `.git`
-    pointer is locked, and planted repositories or Claude Code settings are
-    quarantined after every command and every 15 seconds
-
-  Each of these is tested by attacking a real VM from the inside
-  ([scripts/escape-test.sh](scripts/escape-test.sh)), and the parsers that
-  read VM or repository input are fuzzed. Creating a
-  worktree also never runs the repository's git filter drivers, or its hooks
-  unless you opt in. What isn't covered yet is listed under
-  [Security](#security).
+skerry gives each worktree its own small Linux VM, with its own processes,
+ports, Postgres, Valkey (Redis) and Temporal, and its own copy of their data.
+It plugs into Claude Code, so every worktree session gets one automatically,
+and the VM is ready in the background while the session gets on with the
+work.
 
 ![Two live Claude Code sessions side by side, each in its own skerry workspace: one installs, migrates and places an order on main; the other merges the gift-notes branch, applies its extra migration and places an order with a gift note. Each has its own Postgres and Temporal, so both get order #1.](docs/demo/demo.gif)
 
 *Two real Claude Code sessions, recorded live with
 [asciinema](docs/demo/demo.cast) (idle time trimmed to 2 s; nothing else
-edited). Each runs in its own skerry workspace with its own Postgres and
-Temporal: both install, migrate and place order #1, and the second one's
-branch adds a column the first one's database never sees.*
+edited). Each runs in its own workspace with its own Postgres and
+Temporal: both place order #1, and the second one's branch adds a column the
+first one's database never sees.*
 
-> **Status: early development, macOS on Apple Silicon.** Workspaces, Claude
-> Code integration, per-workspace VMs, networking and services work today.
-> Linux hosts are next. See
-> [What works today](#what-works-today).
+> **Status: early development.** macOS on Apple Silicon today; Linux hosts
+> are being built. See [What works today](#what-works-today).
 
 ---
 
-## The problem
+## Get started with Claude Code
 
-Git worktrees give each branch its own files, but everything else is shared:
-
-```console
-$ node server.js          # worktree A
-listening on :3000
-$ node server.js          # worktree B, at the same time
-Error: listen EADDRINUSE: address already in use :::3000
-```
-
-The same goes for the database (one branch's migration breaks another's), for
-Redis keys, background workers and `/tmp`. With five Claude sessions in five
-worktrees, they all fight over `localhost`.
-
-## What skerry does
-
-Two branches of the same project, each in its own skerry workspace. Neither
-has a `skerry.yaml`: skerry saw `pg` and `@temporalio/*` in `package.json`.
-
-```console
-checkout $ skerry exec -- npm run -s migrate        # branch main
-applied 001_orders.sql
-orders(id, item, status, created_at)
-
-gifts $ skerry exec -- npm run -s migrate           # branch gift-notes
-applied 001_orders.sql
-applied 002_gift_notes.sql
-orders(id, item, status, created_at, gift_note)
-
-gifts $ skerry exec -- npm run -s order -- teapot 'Happy birthday!'
-order #1: teapot (gift note: "Happy birthday!")
-  reserved
-  payment timed out, retrying
-  paid
-  shipped
-workflow order-1 completed
-```
-
-Each workspace ran its own migrations against its own Postgres, and its own
-Temporal server ran the workflow (and retried the failed step). The demo
-project is in [docs/demo](docs/demo).
-
-- **Real isolation, still light.** Each workspace is a Linux VM on Apple's
-  Virtualization framework. It boots in about half a second, and commands
-  start in it in about 50 ms. With Postgres and Temporal, it is ready in
-  about six seconds.
-- **Services, per workspace.** Postgres 17 with pgvector, Valkey (a
-  Redis-compatible fork) and the Temporal dev server, each with its data on
-  a disk of its own that survives restarts. Commands in the VM get
-  `DATABASE_URL`, `REDIS_URL` and `TEMPORAL_ADDRESS`, so apps connect
-  without configuration; `skerry status` shows where each is on your Mac.
-- **Your files stay where they are.** The checkout is shared into the VM at
-  the *same path* as on your Mac, so your editor, git and Claude's file tools
-  work on the host as usual, and paths in errors and stack traces match.
-- **Commands go to the right place automatically.** In Claude Code
-  sessions, `node`, `npm`, `npx`, `yarn`, `pnpm` and `corepack` run in the
-  VM. Everything else, git included, runs on your Mac with your keys and
-  settings. In a terminal, `skerry exec -- CMD` runs anything in the VM.
-- **Built for Claude Code.** skerry plugs into Claude Code's worktree hooks.
-  Every worktree Claude creates (CLI `--worktree`, desktop app, subagents,
-  background sessions) becomes a workspace, and Claude is told how it works.
-- **Opt-in.** skerry only acts in folders you enable. Everywhere else,
-  worktrees stay plain worktrees, made exactly as Claude Code makes them.
-
-The design, threat model and measurements are in
-[docs/design.md](docs/design.md).
-
-## What works today
-
-| | |
-|---|---|
-| ✅ Workspaces: create, list, remove (refuses to lose uncommitted or unpushed work) | |
-| ✅ Opt-in per folder; plain worktrees everywhere else | |
-| ✅ Claude Code hooks: CLI, desktop app, subagents, background sessions | verified |
-| ✅ One VM per workspace on macOS (Apple Silicon) | ~0.5 s boot |
-| ✅ Commands in the VM: `skerry exec`, and shims for Node tooling | ~50 ms per command |
-| ✅ Networking: internet yes; your Mac, LAN and cloud metadata no | |
-| ✅ Services: Postgres 17 + pgvector, Valkey, Temporal; data kept per workspace | ready in ~6 s |
-| ✅ Detecting services from `package.json`, compose files, `go.mod`, Python files; `skerry.yaml` overrides | |
-| ✅ Images built only from signature-verified Wolfi and Alpine packages | |
-| ✅ Seeding from a dump, setup commands (migrations), snapshots cloned per workspace | |
-| ✅ Hot reload: file changes on your Mac reach watchers in the VM | |
-| ✅ Idle VMs stop by themselves; CPU and memory limits | |
-| 🚧 Linux hosts; cloud and self-hosted runners | |
-
-## Requirements
-
-- macOS on Apple Silicon (built and tested on macOS 27)
-- Go 1.27+ and git, to build
-- Network access the first time an image is built: packages come from
-  Wolfi (packages.wolfi.dev) and the kernel from Alpine. About 100 MB, more
-  with services.
-
-## Build
+**1. Install skerry.** For now, build it from source on a Mac with Apple
+Silicon (Go 1.27+):
 
 ```bash
-make build
+git clone https://github.com/skerrysoftware-rgb/skerry && cd skerry
+make build                      # bin/skerry, signed to run VMs
+cp bin/skerry ~/.local/bin/     # or anywhere on your PATH
 ```
 
-This builds the guest agent for Linux, embeds it in `bin/skerry`, and signs
-`bin/skerry` with the `com.apple.security.virtualization` entitlement so it
-can start VMs. A plain `go build` produces a binary without the agent or the
-signature.
-
-## Try it
+**2. Connect it to Claude Code.**
 
 ```bash
-# 1. Enable skerry for a folder of projects (asks for confirmation)
-bin/skerry enable ~/src/myproject
-
-# 2. Make a workspace
-cd ~/src/myproject
-bin/skerry create try-it                 # prints the worktree path
-cd .claude/worktrees/try-it
-
-# 3. Run something in its VM (the first run builds the image: a minute or two)
-bin/skerry exec -- uname -a
-bin/skerry exec -- npm install
-
-# 4. See its services, if it has any, and reach them from your Mac
-bin/skerry status
-psql "$(bin/skerry url postgres)"
-
-# 5. Stop and remove it (removing deletes its data too)
-bin/skerry down try-it
-bin/skerry rm try-it
+skerry claude install
 ```
 
-## Use it with Claude Code
-
-Claude Code can run a session in its own git worktree: a separate checkout of
-the repository, on its own branch, so several sessions can work on different
-tasks without overwriting each other's files. From the terminal that is
-`claude --worktree <name>` (the worktree lands in `.claude/worktrees/<name>`);
-in the desktop app, turn on **Worktree** when starting a session. skerry
-hooks into exactly that moment: in an enabled folder, the worktree also gets
-its own VM, so sessions stop colliding on ports, processes and databases too.
-
-```bash
-bin/skerry claude install
-```
-
-This adds three hooks to `~/.claude/settings.json`: `WorktreeCreate`,
-`WorktreeRemove` and `SessionStart`. It shows them first, keeps a backup, and
-asks which folders to enable. Then start Claude in a worktree as usual:
-
-```bash
-claude --worktree fix-login
-```
-
-or turn on **Worktree** for a new session in the desktop app. Inside an
-enabled folder, the session gets its own workspace, its VM starts in the
-background, and Claude is told how the workspace works. Outside enabled
-folders, nothing changes.
-
-Install the hooks at user level, not in a project: inside a worktree, Claude
-Code reads the project settings committed in that worktree, so project-level
-hooks don't follow sessions there. `bin/skerry claude uninstall` removes them.
-
-**Or install the Claude Code plugin**, which carries the same three hooks
-(skerry itself must still be installed and on your `PATH`):
+This shows the three hooks it will add to `~/.claude/settings.json`
+(`WorktreeCreate`, `WorktreeRemove`, `SessionStart`), keeps a backup, and
+asks which folders to turn skerry on for. skerry only ever acts in those
+folders; everywhere else, worktrees stay plain worktrees. Prefer plugins?
+Install the plugin instead, which carries the same hooks:
 
 ```text
 /plugin marketplace add skerrysoftware-rgb/skerry
 /plugin install skerry@skerry
 ```
 
-Use one or the other, not both: two `WorktreeCreate` hooks would both try
-to make the worktree.
+(Use one or the other: two `WorktreeCreate` hooks would both try to make the
+worktree.)
 
-## Services and `skerry.yaml`
-
-skerry looks at the files a project already has and starts what it uses:
-
-| Service | Started when the project has… | In the VM |
-|---|---|---|
-| `postgres`: PostgreSQL 17 with pgvector | `pg`, `postgres`, `pg-promise` (npm); `pgx`, `lib/pq` (Go); `psycopg`, `asyncpg` (Python); `pg` (Ruby); a `postgres`/`pgvector` image in a compose file | `DATABASE_URL`, `PG*`; database `app` with `vector` installed |
-| `valkey`: Valkey 8 (Redis-compatible) | `redis`, `ioredis`, `bullmq`, `iovalkey` (npm); `go-redis`, `valkey-go`; `redis` (Python, Ruby); a `redis`/`valkey` image | `REDIS_URL`, `VALKEY_URL` |
-| `temporal`: Temporal dev server and UI | `@temporalio/client` or `/worker`; `go.temporal.io/sdk`; `temporalio` (Python); a `temporalio/*` image | `TEMPORAL_ADDRESS` |
-
-To choose explicitly, add a `skerry.yaml` at the repository root:
-
-```yaml
-services: [postgres, temporal]   # [] turns detection off
-ports: [3000]                    # also forward these ports from the VM
-```
-
-## Seeding and setup
-
-A workspace can start with real data, migrated for its own branch:
-
-```yaml
-seed:
-  postgres: db/seed.sql.gz   # .sql, .sql.gz or a pg_dump .dump, in the repository
-setup:                       # run in the VM, in the checkout, when the data is new
-  - npm ci
-  - npm run migrate
-```
-
-When a workspace's data is new, skerry loads the seed (only into an empty
-database), then runs the setup commands, and records the result
-(`skerry status`, `skerry logs setup`). Commands that need the workspace
-wait for setup to finish. `skerry setup` runs it again, for example after
-pulling new migrations.
-
-Dumps that aren't in the repository, such as an anonymized copy of
-production, load from your Mac: `skerry reset --empty`, then
-`skerry seed ~/dumps/prod.dump`. To avoid loading a large dump into every
-workspace, load it once and save a snapshot:
+**3. Start sessions in worktrees, as you already do.**
 
 ```bash
-skerry seed ~/dumps/prod.dump    # in one workspace; setup then migrates it
-skerry snapshot save             # saves it as the repository's default
+claude --worktree fix-login
 ```
 
-Every new workspace of the repository then starts from the snapshot, as
-an APFS clone that is instant and takes no space until it changes, and
-runs its own branch's setup on top. `skerry reset` returns a workspace to
-the snapshot; `skerry reset --empty` to nothing. `skerry snapshot ls` and
-`skerry snapshot rm NAME` manage them.
+or turn on **Worktree** when starting a session in the Claude desktop app.
+Subagents and background sessions that use worktrees work the same way.
 
-The variables are set in the environment of every command in the VM, so
-they take precedence over the same names in a `.env` file: dotenv loaders
-don't override variables that are already set.
-
-A repository can only pick from these presets: it can't add packages,
-daemons or commands to the image. Each service runs as its own unprivileged
-user and listens only inside the VM, with its own password, generated per
-workspace. Its data lives on a disk of
-its own (a sparse file: it takes only the space used) that survives restarts
-and is deleted with the workspace; `skerry reset` empties it.
-
-Postgres and Valkey, and every port in `ports`, are forwarded to
-`127.0.0.1` on your Mac, at a port chosen once per workspace and kept
-across restarts, and reach the VM over skerry's own connection to it, so
-servers that listen only on `localhost` in the VM work too. `skerry status`
-lists them; `skerry url SERVICE` prints a URL, password included, for tools
-such as `psql` or a database GUI. Use a URL only while the workspace runs:
-when it is stopped, another local user could take the port. Web
-ports get a URL such as `http://checkout.localhost:53165`: browsers resolve
-`*.localhost` to your Mac without DNS, and the name keeps the workspace's
-cookies apart from other local apps'. Temporal has no password, so its
-ports are forwarded only if you list them (`ports: [8233]` for the UI).
-
-## Hot reload, idle stop and the status line
-
-Watchers in a VM (dev servers, test runners) see edits you make on your
-Mac: skerry watches the checkout and raises a file event in the VM for
-each changed file (for a new or deleted file, an event on its directory). Changes under `.git`, `node_modules`, `dist`, `build` and similar
-output directories aren't forwarded.
-
-A workspace that nothing has used for 30 minutes (no command running
-through skerry, no forwarded connection) stops its VM; the next command
-starts it again. Its data stays. Forwarded ports don't start it: after an
-idle stop, run `skerry up` before connecting from a database tool.
-
-To see the workspace in Claude Code's status line, add this to
-`~/.claude/settings.json`:
+That's all. Optionally, show each workspace in Claude Code's status line, so
+you can see it being prepared (add to `~/.claude/settings.json`):
 
 ```json
 "statusLine": { "type": "command", "command": "skerry statusline" }
 ```
 
-It prints, for example, `skerry checkout: running · postgres, temporal`,
-and nothing outside skerry workspaces.
+### Codex
 
-## Commands
+Codex support is being built. Codex has session hooks but no worktree
+hooks, so skerry will attach a VM to the worktrees Codex makes rather than
+make them itself. Until then, `skerry create NAME` makes a workspace any
+tool can work in, and `skerry exec -- CMD` runs a command in its VM.
 
-| Command | What it does |
-|---|---|
-| `skerry enable [DIR]` / `disable [DIR]` | Turn skerry on or off for a folder and everything under it |
-| `skerry enable --list` | Show enabled folders |
-| `skerry create NAME [--base BRANCH]` | Make a workspace (worktree on branch `worktree-NAME`, from the default branch or `BRANCH`) and print its path |
-| `skerry ls` | List workspaces and their mode (`skerry` or `plain`) |
-| `skerry up [NAME]` / `down [NAME]` | Start or stop a workspace's VM |
-| `skerry exec [-w NAME] -- CMD…` | Run a command in the workspace's VM |
-| `skerry status [NAME]` | Show its services and the ports they are forwarded to |
-| `skerry url [-w NAME] SERVICE` | Print a URL for a service, for tools on your Mac |
-| `skerry logs [-w NAME] [-f] SERVICE` | Show a service's log; `console` and `network` show the VM's console and refused connections |
-| `skerry reset [NAME] [--snapshot S \| --empty]` | Replace the workspace's service data: as a new workspace's, a snapshot's, or empty |
-| `skerry setup [NAME]` | Run the project's seed and setup commands again |
-| `skerry seed [-w NAME] FILE` | Load a `.sql`, `.sql.gz` or `.dump` file from your Mac into the workspace's empty Postgres |
-| `skerry snapshot save [S]` / `ls` / `rm S` | Save the workspace's service data for new workspaces (`default`), list or delete snapshots |
-| `skerry gc` | Delete images and downloads no workspace needs |
-| `skerry rm NAME [--force]` | Remove a workspace; `--force` discards uncommitted changes but never deletes a branch with commits |
-| `skerry claude install` / `uninstall` | Add or remove the Claude Code hooks |
+## What happens in a session
 
-Settings, through environment variables for now:
+1. **Claude creates the worktree through skerry.** In an enabled folder it
+   becomes a *workspace*; elsewhere, a plain worktree, made the way Claude
+   would make it.
+2. **The session opens right away**, and skerry prepares the workspace in
+   the background: builds or reuses the VM image, boots the VM (about half a
+   second), starts the services, installs dependencies and runs the setup
+   you configured. The first time for a project this takes a minute or two;
+   after that, seconds.
+3. **Nothing waits on that but the commands that need the VM.** Claude can
+   read and edit code and use git meanwhile. A command that needs the VM
+   (`npm test`, say) waits for it, printing each step, and the status line
+   shows where preparation has got to.
+4. **Commands go to the right place automatically.** `node`, `npm`, `npx`,
+   `yarn`, `pnpm` and `corepack` run in the VM, as do the commands of any
+   other runtime the project lists (`python`, `go`, …). Everything else,
+   git included, runs on your machine with your keys and settings. Claude is
+   told how the workspace works when the session starts.
+5. **Removing the worktree removes the workspace**: its VM and its data.
+   Uncommitted work and branches with commits are never deleted.
 
-| Variable | Effect |
-|---|---|
-| `SKERRY_BASE=head` | Start new worktrees at your current commit instead of the remote's default branch |
-| `SKERRY_GIT_HOOKS=1` | Let the repository's git hooks run when creating worktrees (off by default) |
-| `SKERRY_BRANCH_PREFIX` | Prefix for new branches (default `worktree-`) |
-| `SKERRY_SHIMS=off` | Make the shims always run your Mac's own binaries |
-| `SKERRY_HOME` | Keep all of skerry's state and caches under one directory |
-| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused this long (default `30m`; `off` never). The next command starts it again |
-| `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`; at most all CPUs and half the Mac's memory) |
-| `SKERRY_FILE_EVENTS=off` | Don't forward file changes from your Mac to watchers in the VM |
+## Configure a project
+
+Most projects need no configuration. skerry reads the files a project
+already has:
+
+| Service | Started when the project has… | Commands in the VM get |
+|---|---|---|
+| `postgres`: PostgreSQL 17 with pgvector | `pg`, `postgres`, `pg-promise` (npm); `pgx`, `lib/pq` (Go); `psycopg`, `asyncpg` (Python); `pg` (Ruby); a `postgres`/`pgvector` image in a compose file | `DATABASE_URL`, `PG*`; database `app`, with `vector` installed |
+| `valkey`: Valkey 8 (Redis-compatible) | `redis`, `ioredis`, `bullmq`, `iovalkey` (npm); `go-redis`, `valkey-go`; `redis` (Python, Ruby); a `redis`/`valkey` image | `REDIS_URL`, `VALKEY_URL` |
+| `temporal`: Temporal dev server | `@temporalio/client` or `/worker`; `go.temporal.io/sdk`; `temporalio` (Python); a `temporalio/*` image | `TEMPORAL_ADDRESS` |
+
+and installs dependencies from the lockfile it finds (`npm ci`,
+`pnpm install --frozen-lockfile`, `uv sync --frozen`, …). To say exactly
+what a workspace needs, add a `skerry.yaml` at the repository root:
+
+```yaml
+services: [postgres, temporal]
+runtimes: [python@3.12]        # Node is always there
+packages: [ffmpeg]             # extra packages, by name
+setup:                         # in the VM, in order, when the data is new
+  - npm ci
+  - npm run migrate
+ports: [3000]                  # forward a dev server to your machine
+```
+
+Setup runs once for a workspace's data, and again when its inputs change
+(dependencies, migrations, `skerry.yaml`). **[The `skerry.yaml`
+reference](docs/skerry-yaml.md)** explains every key and exactly what runs
+when, in which order.
+
+The services' variables are set for every command in the VM, so they win
+over the same names in a `.env` file (dotenv loaders don't override
+variables that are already set). `skerry status` shows the services and the
+ports they are forwarded to on your machine; `skerry url postgres` prints a
+URL, password included, for tools such as `psql` or a database GUI.
+
+## Working with git
+
+The checkout is never copied into the VM. Your worktree stays an ordinary
+folder on your machine; the VM sees the same folder, live, at the same
+path, through a shared file system. Git runs on your machine, not in the
+VM, so it works as it always does:
+
+- **Rebase, merge, pull, switch branches** in the worktree as usual
+  (`git pull --rebase origin dev`, `git merge dev`). The VM sees the new
+  files the moment git writes them.
+- **New dependencies or migrations arrive with a merge?** The next command
+  that runs in the VM notices (skerry watches lockfiles, migration folders
+  and `skerry.yaml`) and runs setup again first, so the workspace installs
+  them and migrates its own database.
+- **A rebase rewrote migrations the database already ran?** Start the
+  data over: `skerry reset` (back to the snapshot, if the repository has
+  one, else empty), and setup migrates it from scratch.
+- **Your editor, git GUI and Claude's file tools** all work on the same
+  files on your machine; paths in errors and stack traces match.
+
+Code in the VM can't redirect your git: the worktree's `.git` pointer is
+locked, and repositories or Claude Code settings planted in the checkout
+are quarantined (see [Security](#security)).
+
+## Data: seeds and snapshots
+
+A workspace can start with real data, migrated for its own branch. A dump in
+the repository loads in `skerry.yaml` (`seed: {postgres: db/seed.sql.gz}`);
+a dump that isn't (an anonymized copy of production, say) loads from your
+machine:
+
+```bash
+skerry reset --empty && skerry seed ~/dumps/prod.dump   # in one workspace
+skerry snapshot save                                    # make it the default
+```
+
+Every new workspace of the repository then starts from that snapshot (on
+macOS, an APFS clone: instant, and taking no space until it changes) and
+runs its own branch's setup on top. `skerry reset` goes back to the
+snapshot; `skerry snapshot ls` and `skerry snapshot rm NAME` manage them.
+
+## Why not Docker or dev containers?
+
+They solve a different problem: packaging and running services. skerry is
+about giving many parallel coding sessions, and the code agents run, their
+own isolated machines, with no setup per session.
+
+- **Its own kernel per workspace.** Containers share a kernel: on Linux,
+  your machine's; on macOS, one Docker Desktop VM shared by every container.
+  A container escape, or access to the Docker socket, reaches everything.
+  Each skerry workspace is its own VM, so code in one can't reach the
+  others or your machine.
+- **A network that only goes out.** Containers can reach your machine
+  (`host.docker.internal`), your local network and cloud metadata by
+  default. A skerry VM reaches the internet, and nothing local.
+- **Nothing to set up per branch.** Running a compose stack per worktree
+  means unique project names, remapped ports and separate volumes, by hand.
+  skerry does it for every worktree Claude creates, and every workspace uses
+  the normal ports inside its own VM.
+- **Built for agents.** Claude's commands go into the VM transparently,
+  Claude is told how the workspace works, and preparation never blocks a
+  session.
+- **Data per branch, instantly.** A seeded, migrated database is cloned
+  into each new workspace in an instant, then migrated for its branch.
+- **Light.** VMs boot in about half a second from one shared, read-only
+  image; no daemon, no Docker Desktop.
+
+What Docker does better: any image from any registry. skerry offers a fixed
+set of services and runtimes (plus packages by name), and it is not a way to
+deploy anything. A compose file still helps: skerry reads it to tell which
+services a project needs.
 
 ## Security
 
-Workspaces run untrusted code, so skerry is built to contain it.
+Workspaces run untrusted code: dependencies' install scripts, repository
+scripts, and whatever an agent decides to run. skerry is built to contain
+it.
 
 **What protects you**
 
-- **VM boundary.** Each workspace is a Linux VM on Apple's Virtualization
-  framework, which runs it in a separate, sandboxed process. The VM sees only
-  its checkout, the read-only system image and its own config.
+- **VM boundary.** Each workspace is a Linux VM (on macOS, Apple's
+  Virtualization framework, which runs each VM in its own sandboxed
+  process). It sees only its checkout, the read-only system image and its
+  own configuration, never your machine's other files.
 - **A network that only goes out.** A VM's network card connects to a
-  user-mode network stack inside skerry, not to a bridge or your Mac's
+  user-mode network stack inside skerry, not to a bridge or your machine's
   network. Every connection is checked after DNS resolution: public
   addresses are allowed; loopback, private and link-local ranges (cloud
-  metadata included), carrier-grade NAT, multicast, your Mac's own
+  metadata included), carrier-grade NAT, multicast, your machine's own
   addresses and every network it is directly attached to (VPNs included)
   are refused, as is outgoing mail (port 25). A VM can hold at most 512 TCP
-  and 128 UDP flows, so it can't exhaust your Mac's ports. DNS is answered
-  through your Mac's resolver. Refused connections are logged
+  and 128 UDP flows, so it can't exhaust your machine's ports. DNS goes
+  through your machine's resolver. Refused connections are logged
   (`skerry logs network`).
-- **Services reachable only from your Mac.** Forwarded ports listen on
+- **Services reachable only from your machine.** Forwarded ports listen on
   `127.0.0.1` only. Postgres and Valkey each require their own password,
   which other local users can't read; services without a password aren't
   forwarded unless you ask. Output from the VM that skerry prints itself
@@ -379,14 +247,18 @@ Workspaces run untrusted code, so skerry is built to contain it.
 - **Opt-in.** Nothing happens outside folders you enable. Creating a
   worktree never runs the repository's filter drivers, or its hooks unless
   you opt in.
-- **Pinned keys.** Host and VM authenticate each other with per-workspace SSH
-  keys that skerry generates. Nothing is trusted on first use.
+- **Pinned keys.** Host and VM authenticate each other with per-workspace
+  SSH keys that skerry generates. Nothing is trusted on first use.
 - **Verified images.** Every package is checked against a signed index
-  (Wolfi's and Alpine's pinned keys) down to each file, and extraction
-  can't write outside the image directory.
+  (Wolfi's and Alpine's pinned keys) down to each file, extraction can't
+  write outside the image directory, and install scripts run in a build VM.
 - **Careful deletion and bounded logs.** skerry only deletes worktrees it
   created, never a branch that holds commits, and caps the logs a VM can
   write on your disk.
+
+Each of these is tested by attacking a real VM from the inside
+([scripts/escape-test.sh](scripts/escape-test.sh)), and the parsers that read
+VM or repository input are fuzzed.
 
 **Known gaps**
 
@@ -398,20 +270,21 @@ Workspaces run untrusted code, so skerry is built to contain it.
   scans (up to 15 seconds).
 - No disk quota yet: a VM can fill the disk through its checkout, and its
   service data disk can grow to 64 GB.
-- The Temporal dev server and its UI have no authentication. If you
-  forward them, any process of any user on your Mac can reach them.
-- A web page served from a VM and opened in your browser is a local page:
-  it can send requests to other services on your Mac's loopback interface,
-  as any local web app can. Open workspace apps through their
-  `*.localhost` URLs.
+- The Temporal dev server and its UI have no authentication. If you forward
+  them, any process of any user on your machine can reach them.
+- A web page served from a VM and opened in your browser is a local page: it
+  can send requests to other services on your machine's loopback interface,
+  as any local web app can. Open workspace apps through their `*.localhost`
+  URLs.
 - A snapshot's data reaches every new workspace of its repository, whatever
   branch it is on, and code in those VMs can reach the internet. Don't save
   data in a snapshot that you wouldn't give to every branch you check out
   (an outside contributor's included).
-- Setup commands from `skerry.yaml` run in the VM, without asking, when a
-  workspace's data is new, as `npm install` would.
-- A VM can reach anything public, from your Mac's public address: code in
-  it can send what it can read (the checkout) to the internet, and reach
+- Setup commands from `skerry.yaml`, and dependency installs, run in the VM
+  without asking when a workspace's data is new or its dependencies change,
+  as `npm install` would.
+- A VM can reach anything public, from your machine's public address: code
+  in it can send what it can read (the checkout) to the internet, and reach
   services that trust your IP address or a public range routed over your
   VPN. An allowlist mode is planned.
 - No external security review yet.
@@ -419,24 +292,94 @@ Workspaces run untrusted code, so skerry is built to contain it.
 The full threat model, and the rules every change is tested against, are in
 [docs/design.md](docs/design.md#7-security).
 
+## Command reference
+
+You rarely need these with Claude Code; they are for working with workspaces
+by hand.
+
+| Command | What it does |
+|---|---|
+| `skerry claude install` / `uninstall` | Add or remove the Claude Code hooks |
+| `skerry enable [DIR]` / `disable [DIR]`, `enable --list` | Turn skerry on or off for a folder and everything under it |
+| `skerry create NAME [--base BRANCH]` | Make a workspace (worktree on branch `worktree-NAME`) and print its path |
+| `skerry ls` | List workspaces |
+| `skerry status [NAME]` | Show a workspace: preparation, services, setup, forwarded ports |
+| `skerry up [NAME]` / `down [NAME]` | Start (and prepare) or stop a workspace's VM |
+| `skerry exec [-w NAME] -- CMD…` | Run a command in the workspace's VM |
+| `skerry url [-w NAME] SERVICE` | Print a URL for a service, for tools on your machine |
+| `skerry logs [-w NAME] [-f] WHAT` | A service's log, or `setup`, `console`, `network` |
+| `skerry setup [NAME]` | Run the project's seed and setup again |
+| `skerry seed [-w NAME] FILE` | Load a `.sql`, `.sql.gz` or `.dump` file into the workspace's empty Postgres |
+| `skerry snapshot save [S]` / `ls` / `rm S` | Save the workspace's data for new workspaces (`default`); list or delete snapshots |
+| `skerry reset [NAME] [--snapshot S \| --empty]` | Start the workspace's data over |
+| `skerry rm NAME [--force]` | Remove a workspace; `--force` discards uncommitted changes but never a branch with commits |
+| `skerry gc` | Delete images and downloads no workspace needs |
+| `skerry statusline` | One line for Claude Code's status line |
+
+Settings, through environment variables for now:
+
+| Variable | Effect |
+|---|---|
+| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused this long (default `30m`; `off` never). The next command starts it again |
+| `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`; at most all CPUs and half the machine's memory) |
+| `SKERRY_BASE=head` | Start new worktrees at your current commit instead of the remote's default branch |
+| `SKERRY_GIT_HOOKS=1` | Let the repository's git hooks run when creating worktrees (off by default) |
+| `SKERRY_BRANCH_PREFIX` | Prefix for new branches (default `worktree-`) |
+| `SKERRY_FILE_EVENTS=off` | Don't forward file changes to watchers in the VM |
+| `SKERRY_SHIMS=off` | Run your machine's own `node`, `python`… even in workspaces |
+| `SKERRY_HOME` | Keep all of skerry's state and caches under one directory |
+
+A workspace that nothing has used for 30 minutes stops its VM; its data
+stays, and the next command starts it again. Watchers in a VM see edits made
+on your machine: skerry raises a file event in the VM for each changed file.
+
+## What works today
+
+| | |
+|---|---|
+| ✅ Claude Code hooks: CLI, desktop app, subagents, background sessions; plugin | verified |
+| ✅ One VM per workspace on macOS (Apple Silicon) | ~0.5 s boot |
+| ✅ Preparation in the background, with progress in the status line and `skerry status` | |
+| ✅ Networking: internet yes; your machine, local network and cloud metadata no | |
+| ✅ Services: Postgres 17 + pgvector, Valkey, Temporal; data kept per workspace | |
+| ✅ Runtimes: Node, Python, Go, Ruby, Java, Bun, Deno; extra packages by name | |
+| ✅ Dependencies installed from the lockfile; setup re-run when a merge changes them | |
+| ✅ Seeds, setup commands (migrations), snapshots cloned per workspace | |
+| ✅ Hot reload; idle stop; CPU and memory limits | |
+| ✅ Images built only from signature-verified packages | |
+| 🚧 Linux hosts | in progress |
+| 🚧 Codex integration | next |
+| 🚧 Cloud and self-hosted runners | later |
+
+## Building from source
+
+- macOS on Apple Silicon (built and tested on macOS 27); Go 1.27+ and git
+- Network access the first time an image is built: packages come from Wolfi
+  (packages.wolfi.dev) and the kernel from Alpine. About 100 MB, more with
+  services and runtimes.
+
+`make build` builds the guest agent for Linux, embeds it in `bin/skerry`, and
+signs `bin/skerry` with the `com.apple.security.virtualization` entitlement
+so it can start VMs. A plain `go build` produces a binary without the agent
+or the signature.
+
 ## Project layout
 
 ```
 cmd/skerry/          the CLI
 cmd/skerry-agent/    the guest agent (Linux, embedded in the CLI)
-internal/agent/      agent: boot, SSH server, host client
+internal/agent/      agent: boot, SSH server, services supervisor, host client
 internal/engine/     VM drivers (Apple Virtualization framework)
-internal/vmm/        workspace VMs: runner, up/down, image finalize
+internal/vmm/        workspace VMs: runner, preparation, setup, snapshots
 internal/netx/       user-mode network and its policy
-internal/services/   service presets: Postgres, Valkey, Temporal
-internal/project/    skerry.yaml and service detection
+internal/services/   service and runtime presets
+internal/project/    skerry.yaml, detection, default setup
 internal/image/      verified images: packages, kernel, initramfs
 internal/workspace/  worktrees and their lifecycle
 internal/hook/       Claude Code hook handlers
-internal/scope/      enabled folders
+plugin/              the Claude Code plugin
 scripts/             escape tests to run against a real workspace
-docs/demo/           the demo project and the scripts that record the GIF
-docs/design.md       design, threat model, measurements, release plan
+docs/                design, the skerry.yaml reference, the demo
 ```
 
 ## License

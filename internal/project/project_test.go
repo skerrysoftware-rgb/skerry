@@ -153,3 +153,74 @@ func TestNothingToDetect(t *testing.T) {
 		t.Errorf("got %+v, %v", p, err)
 	}
 }
+
+func TestRuntimesPackagesAndDefaultSetup(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "package.json", `{"name":"x"}`)
+	write(t, dir, "pnpm-lock.yaml", "lockfileVersion: 9\n")
+	write(t, dir, "uv.lock", "version = 1\n")
+	write(t, dir, FileName, "runtimes: [python@3.12, go]\npackages: [ffmpeg, ffmpeg]\n")
+	p, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range p.Runtimes {
+		got = append(got, r.String())
+	}
+	if strings.Join(got, " ") != "go@1.27 node@24 python@3.12" {
+		t.Errorf("runtimes = %v", got)
+	}
+	if strings.Join(p.Packages, " ") != "ffmpeg" {
+		t.Errorf("packages = %v", p.Packages)
+	}
+	if len(p.Setup) != 2 || !strings.Contains(p.Setup[0], "pnpm install --frozen-lockfile") || p.Setup[1] != "uv sync --frozen" {
+		t.Errorf("default setup = %q (%s)", p.Setup, p.SetupSource)
+	}
+	for name, text := range map[string]string{
+		"unknown runtime": "runtimes: [cobol]\n",
+		"bad version":     "runtimes: [python@2.7]\n",
+		"bad package":     "packages: ['../x']\n",
+		"escaping watch":  "setup_watch: [../other]\n",
+	} {
+		d := t.TempDir()
+		write(t, d, FileName, text)
+		if _, err := Load(d); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// setup: [] turns the inferred setup off.
+	write(t, dir, FileName, "setup: []\n")
+	if p, err := Load(dir); err != nil || len(p.Setup) != 0 {
+		t.Errorf("setup: [] gave %q, %v", p.Setup, err)
+	}
+}
+
+func TestSetupFingerprintFollowsChanges(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "package.json", `{}`)
+	write(t, dir, "package-lock.json", "{}")
+	if err := os.MkdirAll(filepath.Join(dir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "migrations/001.sql", "create table a();")
+	p, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := p.SetupFingerprint(dir)
+	if again := p.SetupFingerprint(dir); again != before {
+		t.Fatal("fingerprint isn't stable")
+	}
+	// A merge brings a new migration.
+	write(t, dir, "migrations/002.sql", "alter table a add b int;")
+	if p.SetupFingerprint(dir) == before {
+		t.Error("a new migration didn't change the fingerprint")
+	}
+	// Unrelated edits don't.
+	after := p.SetupFingerprint(dir)
+	write(t, dir, "README.md", "hello")
+	if p.SetupFingerprint(dir) != after {
+		t.Error("an unrelated file changed the fingerprint")
+	}
+}

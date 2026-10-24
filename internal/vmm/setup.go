@@ -29,6 +29,10 @@ const setupLogCap = 4 << 20
 type setupRecord struct {
 	At     time.Time `json:"at"`
 	Failed string    `json:"failed,omitempty"`
+	// Inputs fingerprints what setup ran against (project.SetupFingerprint);
+	// when it changes (a merge brought new dependencies or migrations),
+	// setup runs again.
+	Inputs string `json:"inputs,omitempty"`
 }
 
 // The seed scripts load a dump in one transaction, so a failed or
@@ -76,20 +80,20 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 	if err != nil {
 		return err
 	}
-	if done, err := m.setupDone(p); done || err != nil {
+	inputs := m.setupInputs(ws, p, proj)
+	if done, err := m.setupDone(p, inputs); done || err != nil {
 		return err
 	}
-	waiting := time.AfterFunc(500*time.Millisecond, func() {
-		m.progressf("waiting for workspace setup (skerry logs setup)")
-	})
-	unlock, err := lockCtx(ctx, p.setup+".lock")
-	waiting.Stop()
+	unlock, err := m.waitLock(ctx, p.setup+".lock", p.progress)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if done, err := m.setupDone(p); done || err != nil {
+	if done, err := m.setupDone(p, inputs); done || err != nil {
 		return err // another process just ran it
+	}
+	if rec, err := readSetup(p.setup); err == nil && rec.Inputs != inputs {
+		m.progressf("setup's inputs changed (dependencies, migrations or skerry.yaml): running it again")
 	}
 
 	log, err := fsutil.OpenCappedLog(p.setupLog, setupLogCap)
@@ -105,8 +109,16 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 	m.progressf("setting up workspace %s", ws.Name)
 	started := time.Now()
 
+	// The phase names the step, not the command: the command text is the
+	// repository's, and the phase is shown as skerry's own words.
+	steps, step := len(proj.Setup), 0
+	if proj.SeedPostgres != "" {
+		steps++
+	}
 	run := func(label string, args []string, env map[string]string) error {
 		fmt.Fprintf(out, "skerry: %s\n", label)
+		step++
+		m.phase(PhaseSetup, fmt.Sprintf("step %d of %d", step, steps))
 		code, err := c.Run(ctx, agent.Cmd{Args: args, Dir: ws.Path, Env: env, Stdout: out, Stderr: out})
 		if err == nil && code != 0 {
 			err = fmt.Errorf("%w: %s exited with status %d", errSetupFailed, label, code)
@@ -116,7 +128,7 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 	var failure error
 	if proj.SeedPostgres != "" {
 		failure = run("seeding postgres from "+proj.SeedPostgres,
-			[]string{"sh", "-c", seedScript}, map[string]string{"SKERRY_SEED": proj.SeedPostgres})
+			[]string{"sh", "-c", seedScript}, map[string]string{"SKERRY_SEED": proj.SeedPostgres, agent.EnvNoVenv: "1"})
 	}
 	for _, cmd := range proj.Setup {
 		if failure != nil {
@@ -136,13 +148,29 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 		// so commands fail): not the project's failure. Try again next time.
 		return failure
 	}
-	rec := setupRecord{At: time.Now().UTC()}
+	rec := setupRecord{At: time.Now().UTC(), Inputs: inputs}
+	if failure == nil {
+		// Setup may change its own inputs (npm install writes a lockfile):
+		// record them as they are now, so that doesn't run it again.
+		if after, err := project.Load(ws.Path); err == nil {
+			rec.Inputs = m.setupInputs(ws, p, after)
+		}
+	}
 	if failure != nil {
 		rec.Failed = failure.Error()
+		m.phase(PhaseFailed, rec.Failed)
 		m.progressf("WARNING: workspace setup failed: %s; see skerry logs setup, and rerun it with skerry setup", termsafe.Clean(rec.Failed))
 	}
 	data, _ := json.Marshal(rec)
 	return fsutil.WriteFileAtomic(p.setup, data, 0o600)
+}
+
+// setupInputs is what setup depends on: the project's inputs, and the
+// image the VM is running (so setup runs again once a VM with new runtimes
+// or packages boots).
+func (m *Manager) setupInputs(ws registry.Workspace, p wsPaths, proj project.Project) string {
+	image, _ := os.ReadFile(p.image)
+	return proj.SetupFingerprint(ws.Path) + " image " + strings.TrimSpace(string(image))
 }
 
 // stoppedSince reports whether the workspace was asked to stop after t.
@@ -151,15 +179,18 @@ func stoppedSince(p wsPaths, t time.Time) bool {
 	return err == nil && info.ModTime().After(t)
 }
 
-// setupDone reports whether setup has run for the current data, warning
-// (without failing) when it ran and failed.
-func (m *Manager) setupDone(p wsPaths) (bool, error) {
+// setupDone reports whether setup has run for the current data and the
+// current inputs, warning (without failing) when it ran and failed.
+func (m *Manager) setupDone(p wsPaths, inputs string) (bool, error) {
 	rec, err := readSetup(p.setup)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if rec.Inputs != inputs {
+		return false, nil
 	}
 	if rec.Failed != "" {
 		m.progressf("WARNING: this workspace's setup failed (%s); see skerry logs setup, and rerun it with skerry setup", termsafe.Clean(rec.Failed))
@@ -368,7 +399,8 @@ if [ "$tables" != 0 ]; then
 	echo "skerry: the app database isn't empty; empty it with skerry reset --empty" >&2
 	exit 3
 fi`
-	code, err := c.Run(ctx, agent.Cmd{Args: []string{"sh", "-c", "set -e -o pipefail\n" + check + "\n" + script}, Stdin: f, Stdout: out, Stderr: out})
+	code, err := c.Run(ctx, agent.Cmd{Args: []string{"sh", "-c", "set -e -o pipefail\n" + check + "\n" + script},
+		Env: map[string]string{agent.EnvNoVenv: "1"}, Stdin: f, Stdout: out, Stderr: out})
 	if ctx.Err() != nil {
 		time.Sleep(6 * time.Second) // let the agent stop the load before setup may start
 		return ctx.Err()

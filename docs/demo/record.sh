@@ -76,8 +76,10 @@ send 0 "claude -w feature-a --allowedTools Bash"
 send 1 "claude -w feature-b --allowedTools Bash"
 idle 0
 idle 1
-send 0 "Install dependencies, run the migrations, then place an order for an espresso machine. Show me the orders table at the end."
-send 1 "Merge the gift-notes branch, install dependencies, run the migrations, then place an order for a teapot with the gift note 'Happy birthday!'. Show me the orders table at the end."
+# Dependencies and migrations are the workspaces' own setup (skerry.yaml),
+# done in the background; the requests are about the code.
+send 0 "Add a --quantity option to order.js (default 1) and print the quantity in the order line; no schema change. Then place an order for 2 espresso machines and show me the orders table."
+send 1 "Merge the gift-notes branch, then place an order for a teapot with the gift note 'Happy birthday!' and show me the orders table."
 idle 0
 idle 1
 sleep 3

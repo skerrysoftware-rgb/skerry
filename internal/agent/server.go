@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -32,6 +33,10 @@ const (
 
 // EnvCwd carries the working directory for a command.
 const EnvCwd = "SKERRY_CWD"
+
+// EnvNoVenv asks for a command without the project's virtualenv: skerry's
+// own commands (loading a seed) mustn't pick up the project's tools.
+const EnvNoVenv = "SKERRY_NO_VENV"
 
 // Limits on what a client may send.
 const (
@@ -310,8 +315,18 @@ func (s *Server) start(command string, clientEnv map[string]string, ch ssh.Chann
 		env[k] = v
 	}
 	delete(env, EnvCwd)
+	delete(env, EnvNoVenv)
 	for k, v := range baseEnv {
 		env[k] = v
+	}
+	// A project's Python virtualenv (made by uv sync or setup) is active,
+	// as a developer's shell would have it.
+	if s.Workspace != "" && clientEnv[EnvNoVenv] == "" {
+		venv := filepath.Join(s.Workspace, ".venv")
+		if info, err := os.Stat(filepath.Join(venv, "bin", "python")); err == nil && !info.IsDir() {
+			env["VIRTUAL_ENV"] = venv
+			env["PATH"] = filepath.Join(venv, "bin") + ":" + env["PATH"]
+		}
 	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)

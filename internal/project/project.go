@@ -9,6 +9,8 @@ package project
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,20 +53,48 @@ type Project struct {
 	// Setup are shell commands run in the VM, in the checkout, when a
 	// workspace's data is new: installing dependencies, migrations.
 	Setup []string
+	// SetupSource says where Setup came from: FileName, or the lockfile
+	// it was inferred from.
+	SetupSource string
 	// SeedPostgres is a dump in the repository (relative to its root)
 	// loaded into the app database before setup, when the database is
 	// empty: .sql, .sql.gz, or a pg_dump custom-format .dump.
 	SeedPostgres string
+	// Runtimes are the language toolchains in the VM; Node is always one.
+	Runtimes []services.RuntimeChoice
+	// Packages are extra packages for the VM, by name.
+	Packages []string
+	// SetupWatch are paths (relative to the checkout) whose change makes
+	// setup run again: skerry.yaml, lockfiles, migration folders, and any
+	// the project lists. A merge or rebase that brings new dependencies
+	// or migrations is then picked up by the next command.
+	SetupWatch []string
 }
+
+// Lockfiles and migration folders setup watches when they exist.
+var (
+	watchedLockfiles = []string{"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
+		"uv.lock", "requirements.txt", "poetry.lock", "go.sum", "Gemfile.lock"}
+	watchedMigrations = []string{"migrations", "db/migrate", "prisma/migrations", "alembic/versions", "supabase/migrations"}
+)
+
+// maxWatch bounds the paths a project adds to SetupWatch.
+const maxWatch = 32
 
 type config struct {
 	Services *[]string `yaml:"services"`
 	Ports    []int     `yaml:"ports"`
-	Setup    []string  `yaml:"setup"`
+	Runtimes []string  `yaml:"runtimes"`
+	Packages []string  `yaml:"packages"`
+	Setup    *[]string `yaml:"setup"`
+	Watch    []string  `yaml:"setup_watch"`
 	Seed     struct {
 		Postgres string `yaml:"postgres"`
 	} `yaml:"seed"`
 }
+
+// maxPackages bounds a project's extra packages.
+const maxPackages = 32
 
 // seedExtensions are the dump formats skerry loads.
 var seedExtensions = []string{".sql", ".sql.gz", ".dump"}
@@ -72,6 +102,8 @@ var seedExtensions = []string{".sql", ".sql.gz", ".dump"}
 // Load reads the project at dir.
 func Load(dir string) (Project, error) {
 	var p Project
+	var runtimeSpecs []string
+	var setup *[]string
 	data, err := readLimited(filepath.Join(dir, FileName), maxConfig)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -95,15 +127,40 @@ func Load(dir string) (Project, error) {
 				p.Ports = append(p.Ports, uint16(port))
 			}
 		}
-		if len(c.Setup) > maxSetup {
-			return p, fmt.Errorf("%s: at most %d setup commands", FileName, maxSetup)
+		if c.Setup != nil {
+			if len(*c.Setup) > maxSetup {
+				return p, fmt.Errorf("%s: at most %d setup commands", FileName, maxSetup)
+			}
+			for _, cmd := range *c.Setup {
+				if strings.TrimSpace(cmd) == "" || len(cmd) > maxSetupCommand || strings.ContainsRune(cmd, 0) {
+					return p, fmt.Errorf("%s: setup commands must be non-empty and under %d bytes", FileName, maxSetupCommand)
+				}
+			}
+			setup = c.Setup
 		}
-		for _, cmd := range c.Setup {
-			if strings.TrimSpace(cmd) == "" || len(cmd) > maxSetupCommand || strings.ContainsRune(cmd, 0) {
-				return p, fmt.Errorf("%s: setup commands must be non-empty and under %d bytes", FileName, maxSetupCommand)
+		runtimeSpecs = c.Runtimes
+		if len(c.Watch) > maxWatch {
+			return p, fmt.Errorf("%s: at most %d setup_watch paths", FileName, maxWatch)
+		}
+		for _, w := range c.Watch {
+			w = strings.TrimSuffix(w, "/")
+			if !filepath.IsLocal(w) || strings.ContainsRune(w, 0) {
+				return p, fmt.Errorf("%s: setup_watch paths must be inside the repository: %q", FileName, w)
+			}
+			p.SetupWatch = append(p.SetupWatch, filepath.ToSlash(filepath.Clean(w)))
+		}
+		if len(c.Packages) > maxPackages {
+			return p, fmt.Errorf("%s: at most %d packages", FileName, maxPackages)
+		}
+		for _, pkg := range c.Packages {
+			if !services.ValidPackageName(pkg) {
+				return p, fmt.Errorf("%s: %q is not a package name", FileName, pkg)
+			}
+			if !slices.Contains(p.Packages, pkg) {
+				p.Packages = append(p.Packages, pkg)
 			}
 		}
-		p.Setup = c.Setup
+		sort.Strings(p.Packages)
 		if seed := c.Seed.Postgres; seed != "" {
 			// Read in the VM, from the checkout: it must name a file in it.
 			if !filepath.IsLocal(seed) || strings.ContainsAny(seed, "\x00\n") ||
@@ -125,7 +182,156 @@ func Load(dir string) (Project, error) {
 	if p.SeedPostgres != "" && !slices.Contains(p.Services, "postgres") {
 		return p, fmt.Errorf("%s: seed.postgres needs the postgres service", FileName)
 	}
+	if p.Runtimes, err = services.ParseRuntimes(runtimeSpecs); err != nil {
+		return p, fmt.Errorf("%s: %w", FileName, err)
+	}
+	if setup != nil {
+		p.Setup, p.SetupSource = *setup, FileName
+	} else {
+		p.Setup, p.SetupSource = defaultSetup(dir, p.Runtimes)
+	}
+	watch := []string{FileName}
+	if strings.Contains(p.SetupSource, "package.json") {
+		// Only when it is what setup installs from; otherwise editing a
+		// script would reinstall everything.
+		watch = append(watch, "package.json")
+	}
+	if root, err := os.OpenRoot(dir); err == nil {
+		for _, f := range append(watchedLockfiles, watchedMigrations...) {
+			if _, err := root.Lstat(filepath.FromSlash(f)); err == nil {
+				watch = append(watch, f)
+			}
+		}
+		root.Close()
+	}
+	if p.SeedPostgres != "" {
+		watch = append(watch, p.SeedPostgres)
+	}
+	p.SetupWatch = slices.Compact(sortedCopy(append(watch, p.SetupWatch...)))
 	return p, nil
+}
+
+func sortedCopy(s []string) []string {
+	out := slices.Clone(s)
+	sort.Strings(out)
+	return out
+}
+
+// maxFingerprintEntries bounds how many files a fingerprint looks at.
+const maxFingerprintEntries = 20000
+
+// SetupFingerprint summarizes what setup depends on: its commands, its
+// seed, and the name, size and modification time of everything under
+// SetupWatch. Contents aren't read, so it is cheap to compute on every
+// command; git rewrites the files it changes, which changes their times.
+//
+// The checkout is the VM's to write, so the walk stays inside it: it goes
+// through an os.Root, which refuses any path (a planted symbolic link
+// included) that leads out, and reads directories in batches, stopping at
+// a fixed number of entries however large a directory is.
+func (p Project) SetupFingerprint(dir string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "setup %q\nseed %q\n", p.Setup, p.SeedPostgres)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		fmt.Fprintf(h, "unreadable\n")
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	defer root.Close()
+	budget := maxFingerprintEntries
+	for _, w := range p.SetupWatch {
+		fingerprintPath(h, root, filepath.FromSlash(w), &budget)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func fingerprintPath(h io.Writer, root *os.Root, rel string, budget *int) {
+	if *budget <= 0 {
+		return
+	}
+	*budget--
+	info, err := root.Lstat(rel)
+	if err != nil {
+		fmt.Fprintf(h, "%s missing\n", rel)
+		return
+	}
+	if !info.IsDir() {
+		fmt.Fprintf(h, "%s %v %d %d\n", rel, info.Mode().Type(), info.Size(), info.ModTime().UnixNano())
+		return
+	}
+	if name := filepath.Base(rel); name == "node_modules" || name == ".git" || name == "__pycache__" {
+		return
+	}
+	f, err := root.Open(rel)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	for *budget > 0 {
+		entries, err := f.ReadDir(256)
+		for _, e := range entries {
+			fingerprintPath(h, root, filepath.Join(rel, e.Name()), budget)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// defaultSetup infers how to install a project's dependencies from its
+// lockfiles, for the runtimes it has, when skerry.yaml has no setup.
+// Migrations are never guessed: a wrong command against a database is
+// worse than none. `setup: []` turns this off.
+func defaultSetup(dir string, runtimes []services.RuntimeChoice) ([]string, string) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, ""
+	}
+	defer root.Close()
+	has := func(name string) bool {
+		info, err := root.Lstat(name)
+		return err == nil && info.Mode().IsRegular()
+	}
+	var cmds, from []string
+	add := func(cmd, file string) { cmds, from = append(cmds, cmd), append(from, file) }
+	// corepack fetches the yarn or pnpm version package.json asks for,
+	// without asking and without editing package.json.
+	const corepack = "COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_ENABLE_AUTO_PIN=0 corepack "
+	switch {
+	case !has("package.json"):
+	case has("pnpm-lock.yaml"):
+		add(corepack+"pnpm install --frozen-lockfile", "pnpm-lock.yaml")
+	case has("yarn.lock") && has(".yarnrc.yml"):
+		add(corepack+"yarn install --immutable", "yarn.lock")
+	case has("yarn.lock"):
+		add(corepack+"yarn install --frozen-lockfile", "yarn.lock")
+	case has("bun.lock") && services.HasRuntime(runtimes, "bun"):
+		add("bun install --frozen-lockfile", "bun.lock")
+	case has("bun.lockb") && services.HasRuntime(runtimes, "bun"):
+		add("bun install --frozen-lockfile", "bun.lockb")
+	case has("package-lock.json"):
+		add("npm ci", "package-lock.json")
+	default:
+		add("npm install", "package.json")
+	}
+	if services.HasRuntime(runtimes, "python") {
+		switch {
+		case has("uv.lock"):
+			add("uv sync --frozen", "uv.lock")
+		case has("requirements.txt"):
+			add("uv venv --allow-existing .venv && uv pip install --python .venv -r requirements.txt", "requirements.txt")
+		}
+	}
+	if services.HasRuntime(runtimes, "go") && has("go.mod") {
+		add("go mod download", "go.mod")
+	}
+	if services.HasRuntime(runtimes, "ruby") && has("Gemfile") {
+		add("bundle config set --local path vendor/bundle && bundle install", "Gemfile")
+	}
+	if len(cmds) == 0 {
+		return nil, ""
+	}
+	return cmds, "inferred from " + strings.Join(from, ", ")
 }
 
 // detector maps a file's contents to the services it implies.

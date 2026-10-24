@@ -24,7 +24,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,8 +45,18 @@ import (
 	"github.com/skerrysoftware-rgb/skerry/internal/termsafe"
 )
 
-// Packages every workspace image gets in this release; services add theirs.
-var Packages = []string{"nodejs-24", "npm", "curl"}
+// Packages every workspace image gets; runtimes (Node always among them),
+// services and the project's own extra packages add theirs.
+var Packages = []string{"curl"}
+
+// ImagePackages lists the packages a project's image needs, runtimes first
+// so that a runtime's version is the one later packages resolve against.
+func ImagePackages(proj project.Project) []string {
+	pkgs := services.RuntimePackages(proj.Runtimes)
+	pkgs = append(pkgs, Packages...)
+	pkgs = append(pkgs, services.Packages(proj.Services)...)
+	return append(pkgs, proj.Packages...)
+}
 
 // Resources and limits for each workspace VM.
 const (
@@ -85,6 +94,11 @@ type Manager struct {
 	Self string
 	// Progress receives human-readable progress lines; nil discards them.
 	Progress io.Writer
+
+	// progressFile, once Up starts on a workspace, records its progress
+	// for other processes to show; lastProgress is what it last recorded.
+	progressFile string
+	lastProgress Progress
 }
 
 func (m *Manager) progressf(format string, args ...any) {
@@ -97,7 +111,7 @@ func (m *Manager) progressf(format string, args ...any) {
 type wsPaths struct {
 	state, share, socket, lock, console, runnerLog, pid, machineID string
 	dataDisk, secret, status, networkLog, image, setup, setupLog   string
-	stopping                                                       string
+	stopping, progress, prepare, runtimes, imageSpec               string
 }
 
 func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
@@ -123,6 +137,10 @@ func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
 		setup:      filepath.Join(state, "setup.json"),
 		setupLog:   filepath.Join(state, "setup.log"),
 		stopping:   filepath.Join(state, "stopping"),
+		progress:   filepath.Join(state, "progress.json"),
+		prepare:    filepath.Join(state, "prepare.lock"),
+		runtimes:   filepath.Join(state, "runtimes"),
+		imageSpec:  filepath.Join(state, "image-spec"),
 	}, nil
 }
 
@@ -164,7 +182,7 @@ func (m *Manager) Image(ctx context.Context, proj project.Project) (image.Image,
 	if err := os.MkdirAll(filepath.Join(m.Dirs.Cache, "images"), 0o755); err != nil {
 		return image.Image{}, err
 	}
-	spec := image.Spec{Packages: append(slices.Clone(Packages), services.Packages(proj.Services)...), Agent: agentBin}
+	spec := image.Spec{Packages: ImagePackages(proj), Agent: agentBin}
 	// A pinned image is used as it is; otherwise the newest packages are
 	// resolved, and the result (perhaps the same image) is pinned afresh.
 	img, pinned := b.Pinned(spec, imageMaxAge)
@@ -218,7 +236,12 @@ func (m *Manager) builder() (*image.Builder, error) {
 	}
 	return &image.Builder{
 		Dir: m.Dirs.Cache, System: system, Kernel: kernel, Arch: image.WolfiArch(runtime.GOARCH),
-		Log: func(f string, a ...any) { m.progressf("  "+f, a...) },
+		Log: func(f string, a ...any) {
+			m.progressf("  "+f, a...)
+			if m.lastProgress.Phase == PhaseImage {
+				m.writeProgress(Progress{Phase: PhaseImage, Detail: fmt.Sprintf(f, a...)})
+			}
+		},
 	}, nil
 }
 
@@ -360,6 +383,8 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	if err := fsutil.WriteFileAtomic(p.image, []byte(img.ID+"\n"), 0o600); err != nil {
 		return err
 	}
+	_ = fsutil.WriteFileAtomic(p.imageSpec, []byte(imageSpec(proj)+"\n"), 0o600)
+	m.noteRuntimes(ws, proj)
 	// Written once, before boot, while nothing reads it.
 	cfg := agent.Config{
 		Mode: agent.ModeServe, WorkspacePath: ws.Path, Hostname: hostname(ws.Name),
@@ -577,12 +602,19 @@ func (m *Manager) Connect(ws registry.Workspace) (*agent.Client, error) {
 // Up starts the workspace's VM in the background, if it isn't running, and
 // waits until its agent answers and its services are ready.
 func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client, error) {
+	m.track(ws)
 	c, err := m.boot(ctx, ws)
 	if err != nil {
+		if m.lastProgress.Busy() {
+			m.phase(PhaseStartFailed, err.Error())
+		}
 		return nil, err
 	}
 	// A command may not need the services, so a failed service is a
 	// warning, not a reason to refuse to run anything.
+	if m.lastProgress.Busy() {
+		m.phase(PhaseServices, "")
+	}
 	if err := m.waitServices(ctx, c); err != nil {
 		if ctx.Err() != nil {
 			c.Close()
@@ -592,6 +624,8 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 	}
 	proj, err := project.Load(ws.Path)
 	if err == nil {
+		m.noteRuntimes(ws, proj)
+		m.warnStaleImage(ws, proj)
 		err = m.ensureSetup(ctx, c, ws, proj)
 	}
 	if err != nil {
@@ -600,8 +634,29 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 			return nil, ctx.Err()
 		}
 		m.progressf("WARNING: %s", termsafe.Clean(err.Error()))
+		if m.lastProgress.Busy() {
+			m.phase(PhaseInterrupted, "")
+		}
+	} else if m.lastProgress.Busy() {
+		m.phase(PhaseReady, "")
 	}
 	return c, nil
+}
+
+// warnStaleImage says when skerry.yaml asks for runtimes, services or
+// packages the running VM doesn't have: a VM keeps its image until it
+// restarts.
+func (m *Manager) warnStaleImage(ws registry.Workspace, proj project.Project) {
+	p, err := m.paths(ws)
+	if err != nil {
+		return
+	}
+	running, err := os.ReadFile(p.imageSpec)
+	if err != nil || strings.TrimSpace(string(running)) == imageSpec(proj) {
+		return
+	}
+	m.progressf("WARNING: skerry.yaml asks for runtimes, services or packages this VM doesn't have; " +
+		"they take effect when it restarts (skerry down, then any command)")
 }
 
 // limitedBuffer keeps the first max bytes written to it and drops the rest.
@@ -664,6 +719,7 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		return nil, err
 	}
 
+	bootStarted := time.Now()
 	var (
 		runner     *exec.Cmd
 		runnerDone atomic.Bool // set once Wait has returned
@@ -676,9 +732,14 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		if err != nil {
 			return err
 		}
+		m.phase(PhaseImage, "")
 		if _, err := m.Image(ctx, proj); err != nil {
 			return err
 		}
+		if stoppedSince(p, bootStarted) {
+			return fmt.Errorf("%s was stopped while it was being prepared", ws.Name)
+		}
+		m.phase(PhaseBoot, "")
 		m.progressf("starting workspace %s", ws.Name)
 		starts++
 		r, err := m.spawnRunner(ws, p)
@@ -695,7 +756,17 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		return nil
 	}
 	if !m.Running(ws) {
-		if err := start(); err != nil {
+		// One process prepares a workspace at a time; others wait, showing
+		// its progress, instead of building the same image alongside it.
+		unlock, err := m.waitLock(ctx, p.prepare, p.progress)
+		if err != nil {
+			return nil, err
+		}
+		if !m.Running(ws) {
+			err = start()
+		}
+		unlock()
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -734,7 +805,15 @@ func (m *Manager) boot(ctx context.Context, ws registry.Workspace) (*agent.Clien
 		// The workspace was running when we looked but has stopped since
 		// (an idle stop, skerry down): start it again.
 		if runner == nil && !m.Running(ws) && starts < 3 {
-			if err := start(); err != nil {
+			unlock, err := m.waitLock(ctx, p.prepare, p.progress)
+			if err != nil {
+				return nil, err
+			}
+			if !m.Running(ws) {
+				err = start()
+			}
+			unlock()
+			if err != nil {
 				return nil, err
 			}
 			deadline = time.After(bootTimeout) // the new runner gets its own time

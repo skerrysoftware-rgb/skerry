@@ -252,38 +252,6 @@ it doesn't take the VM's memory; the home directory keeps it across
 restarts, and `/tmp` starts empty. It is never in a snapshot,
 `skerry reset` leaves it, and removing the workspace deletes it.
 
-## Why not Docker, dev containers, or one Linux VM?
-
-They solve a different problem: packaging and running services, or giving
-you one Linux machine (OrbStack, Lima, a dev VM). skerry is about giving
-many parallel coding sessions, and the code agents run, their own isolated
-machines, set up from the repository, with no setup per session.
-
-- **Its own kernel per workspace.** Containers share a kernel: on Linux,
-  your machine's; on macOS, one Docker Desktop VM shared by every container.
-  A container escape, or access to the Docker socket, reaches everything.
-  Each skerry workspace is its own VM, so code in one can't reach the
-  others or your machine.
-- **A network that only goes out.** Containers can reach your machine
-  (`host.docker.internal`), your local network and cloud metadata by
-  default. A skerry VM reaches the internet, and nothing local.
-- **Nothing to set up per branch.** Running a compose stack per worktree
-  means unique project names, remapped ports and separate volumes, by hand.
-  skerry does it for every worktree Claude creates, and every workspace uses
-  the normal ports inside its own VM.
-- **Built for agents.** Claude's commands go into the VM transparently,
-  Claude is told how the workspace works, and preparation never blocks a
-  session.
-- **Data per branch, instantly.** A seeded, migrated database is cloned
-  into each new workspace in an instant, then migrated for its branch.
-- **Light.** VMs boot in about half a second from one shared, read-only
-  image; no daemon, no Docker Desktop.
-
-What Docker does better: any image from any registry. skerry offers a fixed
-set of services and runtimes (plus packages by name), and it is not a way to
-deploy anything. A compose file still helps: skerry reads it to tell which
-services a project needs.
-
 ## Security
 
 Workspaces run untrusted code: dependencies' install scripts, repository

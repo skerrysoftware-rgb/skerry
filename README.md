@@ -409,25 +409,6 @@ signs `bin/skerry` with the `com.apple.security.virtualization` entitlement
 so it can start VMs. A plain `go build` produces a binary without the agent
 or the signature.
 
-## Project layout
-
-```
-cmd/skerry/          the CLI
-cmd/skerry-agent/    the guest agent (Linux, embedded in the CLI)
-internal/agent/      agent: boot, SSH server, services supervisor, host client
-internal/engine/     VM drivers (Apple Virtualization framework)
-internal/vmm/        workspace VMs: runner, preparation, setup, snapshots
-internal/netx/       user-mode network and its policy
-internal/services/   service and runtime presets
-internal/project/    skerry.yaml, detection, default setup
-internal/image/      verified images: packages, kernel, initramfs
-internal/workspace/  worktrees and their lifecycle
-internal/hook/       Claude Code hook handlers
-plugin/              the Claude Code plugin
-scripts/             escape tests to run against a real workspace
-docs/                design, the skerry.yaml reference, the demo
-```
-
 ## License
 
 MIT. See [LICENSE](LICENSE).

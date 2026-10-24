@@ -90,7 +90,8 @@ kill -9 "$rec" 2>/dev/null || true
 wait "$rec" 2>/dev/null || true
 t kill-server 2>/dev/null || true
 
-# Nothing personal may be in the recording.
+# Nothing personal may be in the recording: the user's name, the machine's
+# name, or any word in $PRIVATE_WORDS (a | separated list).
 if grep -iE "$(id -un)|$(hostname -s)${PRIVATE_WORDS:+|$PRIVATE_WORDS}" "$CAST" >/dev/null; then
 	echo "the recording contains personal data; not rendering it" >&2
 	exit 1

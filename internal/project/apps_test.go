@@ -420,7 +420,7 @@ func TestEnvShapeDropsSecrets(t *testing.T) {
 		"PORT":         "5183",
 		"DATABASE_URL": "postgres://shop:hunter2@localhost:5432/shop?sslmode=disable",
 		"API_URL":      "localhost:4000",
-		"STRIPE_KEY":   "sk_live_abc",
+		"STRIPE_KEY":   "not-a-real-key",
 		"REMOTE_DB":    "postgres://u:pw@db.example.com/x",
 	})
 	want := map[string]string{

@@ -41,10 +41,12 @@ t kill-server 2>/dev/null || true
 t new-session -d -s demo -x "$COLS" -y "$ROWS" -c "$REPO" "$shell"
 t set -g status off
 t set -g pane-border-status top
-t set -g pane-border-format " #{pane_title} "
+# Fixed labels: Claude Code sets its own pane titles, starting with escape
+# sequences no one should see.
+t set -g pane-border-format " #{@label} "
 t split-window -h -t demo -c "$REPO" "$shell"
-t select-pane -t demo.0 -T "Claude Code session 1"
-t select-pane -t demo.1 -T "Claude Code session 2"
+t set -p -t demo.0 @label "Claude Code session 1 · branch main"
+t set -p -t demo.1 @label "Claude Code session 2 · merges the gift-notes branch"
 
 rm -f "$CAST"
 TERM=xterm-256color asciinema rec --headless --overwrite --window-size "${COLS}x${ROWS}" -c "tmux -u -L skerry-demo -f /dev/null attach -t demo" "$CAST" &

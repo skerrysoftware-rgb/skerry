@@ -15,13 +15,15 @@ It plugs into Claude Code, so every worktree session gets one automatically,
 and the VM is ready in the background while the session gets on with the
 work.
 
-![Two live Claude Code sessions side by side, each in its own skerry workspace: one installs, migrates and places an order on main; the other merges the gift-notes branch, applies its extra migration and places an order with a gift note. Each has its own Postgres and Temporal, so both get order #1.](docs/demo/demo.gif)
+![Two live Claude Code sessions side by side, each in its own skerry workspace. As they start, the status line shows skerry preparing each workspace in the background (starting the VM, setting up) while Claude reads and edits code. One adds a feature and places an order; the other merges a branch that brings a new migration and places an order with a gift note. Each has its own Postgres and Temporal, so both get order #1.](docs/demo/demo.gif)
 
 *Two real Claude Code sessions, recorded live with
 [asciinema](docs/demo/demo.cast) (idle time trimmed to 2 s; nothing else
-edited). Each runs in its own workspace with its own Postgres and
-Temporal: both place order #1, and the second one's branch adds a column the
-first one's database never sees.*
+edited). As each session opens, skerry prepares its workspace in the
+background (the VM, Postgres, Temporal, `npm install`, migrations), shown
+in the status line, while Claude gets on with the code. Each has its own
+database: both place order #1, and only the second, which merged a branch
+with a new migration, has a `gift_note` column.*
 
 > **Status: early development.** macOS on Apple Silicon today; Linux hosts
 > are being built. See [What works today](#what-works-today).

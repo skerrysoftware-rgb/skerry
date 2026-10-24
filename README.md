@@ -50,16 +50,25 @@ skerry claude install
 This shows the three hooks it will add to `~/.claude/settings.json`
 (`WorktreeCreate`, `WorktreeRemove`, `SessionStart`), keeps a backup, and
 asks which folders to turn skerry on for. skerry only ever acts in those
-folders; everywhere else, worktrees stay plain worktrees. Prefer plugins?
-Install the plugin instead, which carries the same hooks:
+folders; everywhere else, worktrees stay plain worktrees.
+
+Prefer Claude Code plugins? Install skerry's plugin instead: it carries the
+same three hooks (and a small script that finds the `skerry` command), and
+nothing else. In any Claude Code session, from any folder, run:
 
 ```text
 /plugin marketplace add skerrysoftware-rgb/skerry
 /plugin install skerry@skerry
 ```
 
-(Use one or the other: two `WorktreeCreate` hooks would both try to make the
-worktree.)
+The first command adds this GitHub repository
+(github.com/skerrysoftware-rgb/skerry) as a plugin marketplace: Claude Code
+downloads the plugin from it, using your git access to GitHub. The second
+installs the plugin for your user, in every project. The plugin doesn't
+include skerry itself, which must already be installed and on your `PATH`
+(step 1), and skerry still only acts in the folders you enable
+(`skerry enable DIR`). Use the plugin or `skerry claude install`, not both:
+two `WorktreeCreate` hooks would both try to make the worktree.
 
 **3. Start sessions in worktrees, as you already do.**
 

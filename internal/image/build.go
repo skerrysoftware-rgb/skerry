@@ -489,31 +489,88 @@ func (b *Builder) repoDir(src Source, repo string) string {
 	return filepath.Join(b.Dir, "packages", src.Name, repoKey(repo), b.Arch)
 }
 
+// Downloads give up on a connection only when it stalls, not because a
+// large package on a slow link takes a while, and try again on a new
+// connection (often a different server of the mirror). What arrives is
+// checked against the signed index either way.
+var (
+	downloadStall    = 30 * time.Second
+	downloadAttempts = 3
+)
+
 func (b *Builder) download(ctx context.Context, url string, limit int64) ([]byte, error) {
+	var err error
+	for attempt := 1; attempt <= downloadAttempts; attempt++ {
+		var data []byte
+		var retry bool
+		if data, retry, err = b.downloadOnce(ctx, url, limit); err == nil || !retry || ctx.Err() != nil {
+			return data, err
+		}
+		if attempt < downloadAttempts {
+			b.logf("%v; trying again", err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+	}
+	return nil, err
+}
+
+// downloadOnce fetches url once; retry says whether another attempt could
+// succeed (a network failure or a server error, not a missing file).
+func (b *Builder) downloadOnce(ctx context.Context, url string, limit int64) (data []byte, retry bool, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stalled := time.AfterFunc(downloadStall, cancel)
+	defer stalled.Stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	client := b.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
+		client = http.DefaultClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, stallError(url, err, stalled)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+		return nil, resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	data, err = io.ReadAll(io.LimitReader(progressReader{resp.Body, func() { stalled.Reset(downloadStall) }}, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
+		return nil, true, stallError(url, err, stalled)
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("GET %s: larger than expected", url)
+		return nil, false, fmt.Errorf("GET %s: larger than expected", url)
 	}
-	return data, nil
+	return data, false, nil
+}
+
+// stallError says a download stalled when that is what ended it.
+func stallError(url string, err error, stalled *time.Timer) error {
+	if !stalled.Stop() { // it fired: the connection made no progress
+		return fmt.Errorf("GET %s: no data for %s", url, downloadStall)
+	}
+	return fmt.Errorf("GET %s: %w", url, err)
+}
+
+// progressReader calls progress whenever data arrives.
+type progressReader struct {
+	r        io.Reader
+	progress func()
+}
+
+func (p progressReader) Read(buf []byte) (int, error) {
+	n, err := p.r.Read(buf)
+	if n > 0 {
+		p.progress()
+	}
+	return n, err
 }
 
 func readManifest(dir string) (manifest, error) {

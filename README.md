@@ -31,6 +31,14 @@ things:
   unless you opt in. What isn't covered yet is listed under
   [Security](#security).
 
+![Two live Claude Code sessions side by side, each in its own skerry workspace: one installs, migrates and places an order on main; the other merges the gift-notes branch, applies its extra migration and places an order with a gift note. Each has its own Postgres and Temporal, so both get order #1.](docs/demo/demo.gif)
+
+*Two real Claude Code sessions, recorded live with
+[asciinema](docs/demo/demo.cast) (idle time trimmed to 2 s; nothing else
+edited). Each runs in its own skerry workspace with its own Postgres and
+Temporal: both install, migrate and place order #1, and the second one's
+branch adds a column the first one's database never sees.*
+
 > **Status: early development, macOS on Apple Silicon.** Workspaces, Claude
 > Code integration, per-workspace VMs, networking and services work today.
 > Linux hosts are next. See

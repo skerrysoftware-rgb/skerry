@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/skerrysoftware-rgb/skerry/internal/services"
 )
@@ -62,6 +64,71 @@ type Config struct {
 	Services []string `json:"services,omitempty"`
 	// Secret is the workspace's password for its services.
 	Secret string `json:"secret,omitempty"`
+	// Apps are the project's own services, run once the host says setup is
+	// done.
+	Apps []App `json:"apps,omitempty"`
+	// PortAliases are other ports the services answer on in the VM: the
+	// ones the project's env files use (a compose file's 54320 for
+	// Postgres, say).
+	PortAliases []PortAlias `json:"port_aliases,omitempty"`
+}
+
+// PortAlias relays a loopback port to a service's own.
+type PortAlias struct {
+	Port uint16 `json:"port"`
+	To   uint16 `json:"to"`
+}
+
+// App is one of the project's own services, as the agent runs it.
+type App struct {
+	Name string `json:"name"`
+	// Dir is where it runs, inside WorkspacePath.
+	Dir     string `json:"dir"`
+	Command string `json:"command"`
+	// EnvFiles are loaded into its environment, later ones winning; each
+	// is inside WorkspacePath.
+	EnvFiles []string `json:"env_files,omitempty"`
+	// Ports it should listen on, which skerry status checks.
+	Ports []uint16 `json:"ports,omitempty"`
+}
+
+// AppState is what `skerry status` shows for an app.
+type AppState struct {
+	Name     string    `json:"name"`
+	State    string    `json:"state"` // starting, running, restarting, stopped
+	PID      int       `json:"pid,omitempty"`
+	Restarts int       `json:"restarts"`
+	LastExit string    `json:"last_exit,omitempty"`
+	Since    time.Time `json:"since"`
+	// Listening and Closed are its ports that accept connections, and
+	// those that don't (yet).
+	Listening []uint16 `json:"listening,omitempty"`
+	Closed    []uint16 `json:"closed,omitempty"`
+	// Output is the end of its log, when it isn't running well.
+	Output []string `json:"output,omitempty"`
+}
+
+var appNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+func (a App) validate(workspace string) error {
+	if !appNamePattern.MatchString(a.Name) {
+		return fmt.Errorf("invalid app name %q", a.Name)
+	}
+	if len(a.Ports) > 8 {
+		return fmt.Errorf("app %s has more than 8 ports", a.Name)
+	}
+	if a.Dir != workspace && !isWithin(a.Dir, workspace) {
+		return fmt.Errorf("app %s runs outside the workspace", a.Name)
+	}
+	if a.Command == "" || len(a.Command) > 4096 || strings.ContainsRune(a.Command, 0) {
+		return fmt.Errorf("app %s has an invalid command", a.Name)
+	}
+	for _, f := range a.EnvFiles {
+		if !isWithin(f, workspace) {
+			return fmt.Errorf("app %s reads an env file outside the workspace", a.Name)
+		}
+	}
+	return nil
 }
 
 // Network is the guest side of the workspace network.
@@ -98,6 +165,39 @@ func (c Config) Validate() error {
 	if n := c.Network; n != nil {
 		if !n.Address.IsValid() || !n.Address.Addr().Is4() || !n.Gateway.Is4() || !n.DNS.Is4() || !n.Address.Contains(n.Gateway) {
 			return fmt.Errorf("invalid network %+v", *n)
+		}
+	}
+	if len(c.Apps) > 32 {
+		return errors.New("too many apps")
+	}
+	names := map[string]bool{}
+	for _, a := range c.Apps {
+		if names[a.Name] {
+			return fmt.Errorf("two apps are named %s", a.Name)
+		}
+		names[a.Name] = true
+		if c.Mode != ModeServe {
+			return errors.New("apps run only in workspaces")
+		}
+		if err := a.validate(c.WorkspacePath); err != nil {
+			return err
+		}
+	}
+	if len(c.PortAliases) > 8 {
+		return errors.New("too many port aliases")
+	}
+	for _, a := range c.PortAliases {
+		if a.Port == 0 || slices.ContainsFunc(services.Names(), func(name string) bool {
+			p, _ := services.Lookup(name)
+			return slices.ContainsFunc(p.Ports, func(sp services.Port) bool { return sp.Guest == a.Port })
+		}) {
+			return fmt.Errorf("port alias %d is a service's own port", a.Port)
+		}
+		if !slices.ContainsFunc(c.Services, func(name string) bool {
+			p, _ := services.Lookup(name)
+			return slices.ContainsFunc(p.Ports, func(sp services.Port) bool { return sp.Guest == a.To && sp.Guest != a.Port })
+		}) {
+			return fmt.Errorf("port alias %d → %d is not to a service's port", a.Port, a.To)
 		}
 	}
 	if len(c.Services) > 0 {

@@ -152,3 +152,31 @@ func isMountPoint(dir string) bool {
 	}
 	return st.Dev != parent.Dev
 }
+
+// packageManagerShims makes yarn and pnpm commands of their own, run
+// through corepack, so `yarn dev` works as it does on a developer's
+// machine with corepack enabled. /usr/local/bin is in the in-memory
+// overlay, so this happens at every boot and never reaches the image.
+func packageManagerShims() {
+	corepack, err := lookPath("corepack")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll("/usr/local/bin", 0o755); err != nil {
+		return
+	}
+	for _, name := range []string{"yarn", "yarnpkg", "pnpm", "pnpx"} {
+		if _, err := lookPath(name); err == nil {
+			continue // the image has its own
+		}
+		tool := name
+		switch name {
+		case "yarnpkg":
+			tool = "yarn"
+		case "pnpx":
+			tool = "pnpm dlx"
+		}
+		script := "#!/bin/sh\nexec " + corepack + " " + tool + ` "$@"` + "\n"
+		_ = os.WriteFile(filepath.Join("/usr/local/bin", name), []byte(script), 0o755)
+	}
+}

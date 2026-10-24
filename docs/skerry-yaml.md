@@ -20,6 +20,9 @@ setup:                                   # then these, in order
   - npm run migrate
 setup_watch: [db/schema.prisma]          # also re-run setup when these change
 
+# The project's own services, which `skerry start` runs; never on their own.
+apps: [api, web]                         # what it runs; [] means none
+
 # Reaching the VM from your machine.
 ports: [3000]
 ```
@@ -50,6 +53,9 @@ opens, in the background):
    changes or you run `skerry setup`.
 5. **Ready.** Commands that run in the VM go ahead.
 
+The project's apps aren't part of this: they start only when someone
+runs `skerry start` (see `apps`).
+
 None of this blocks a session. Claude (or you) can read and edit code and
 use git while it happens. Only commands that run in the VM wait for it,
 and while they wait they print each step. `skerry status` and the status
@@ -67,6 +73,73 @@ Setup's own changes (`npm install` writing `package-lock.json`, say) don't
 count: what it depends on is recorded after it finishes.
 Setup commands should therefore be safe to repeat, as `npm ci` and
 migration tools are.
+
+## What skerry finds without `skerry.yaml`
+
+- **Monorepos.** It reads every workspace package (npm, Yarn and Bun
+  `workspaces`, `pnpm-workspace.yaml`), not just the root.
+- **Services** from the packages' dependencies, compose files, `go.mod`,
+  Python and Ruby manifests, and local URLs in `.env` files
+  (`postgres://…@localhost`, `redis://localhost`, a Temporal address on
+  `:7233`).
+- **Env files.** A new workspace gets copies of the `.env`, `.env.local`,
+  `.env.development` and `.env.development.local` files git ignores in your
+  main checkout (outside `node_modules`), as a developer's checkout has
+  them. A repository with a `.worktreeinclude` gets exactly what that
+  lists instead.
+- **Databases.** Every local Postgres database those files point to is
+  created, owned by the user the URL names, so the URLs work unchanged:
+  `postgresql://user:pass@localhost:5432/mydb` finds `mydb`. So is the
+  database a compose file's Postgres service is told to create
+  (`POSTGRES_USER`, `POSTGRES_DB`), which the project's settings often
+  expect. A local
+  Postgres or Redis URL on another port (a compose file's `54320`, say)
+  reaches the VM's service too: it answers on that port as well.
+- **Runtimes**, without a `runtimes` key: Python from `pyproject.toml`,
+  `requirements.txt`, `uv.lock`, `Pipfile` or `manage.py`; Ruby from a
+  `Gemfile`; Go from `go.mod`. The version is the one the project pins
+  (`.python-version`, `requires-python`, `.ruby-version`, go.mod's `go`
+  line) when skerry offers it, otherwise the default.
+- **Apps**:
+  - packages with a `dev` script whose port is known: from a flag in the
+    script (`-p 3003`, `--port=8080`), a port variable in its env files
+    (`PORT`, `HTTP_PORT`, `SERVER_PORT`, `SERVER_HTTP_PORT`, `APP_PORT`,
+    …), or the dev server's own default (Next and Nuxt 3000, Vite and
+    React Router 5173, Astro 4321, Angular 4200). Env files the script
+    loads itself (`dotenv -e ../../.env`) count as its own. An app whose
+    folder has a `.env.example` but no `.env` isn't set up locally and
+    isn't among them.
+  - each process in `Procfile.dev` (or, for a project without a `dev`
+    script, `Procfile`), run as foreman runs it, with `PORT` set (5000, 5100, …, or the base `bin/dev` sets);
+    `release` is skipped.
+  - without a Procfile, a Django project's `manage.py runserver` (8000) or
+    a Rails project's `bin/rails server` (3000).
+
+  When the root `dev` script names the packages it starts
+  (`turbo run dev --filter=web`, `pnpm --filter web dev`),
+  `skerry start` runs only those; the others are listed by `skerry plan`
+  and run when named. Two apps can't share a port: the ones
+  `skerry start` runs keep theirs. Each
+  app also gets the `dev` watchers of the workspace packages it uses
+  (libraries that rebuild their output), as a monorepo's dev setup runs
+  them.
+- **Builds.** Setup runs the steps the root `dev` script takes before
+  starting its dev servers (`npm run codegen && turbo run dev` runs
+  `npm run codegen`; only calls to the repository's own scripts, and none
+  that starts containers). In a monorepo, it then builds what the apps
+  import, with the repository's tool: turbo
+  (`turbo run build --filter=app^...`), pnpm filters, or
+  `yarn workspaces foreach`.
+
+`skerry plan` prints all of this for a checkout without starting
+anything, and, for each app, how it is wired: every local address its env
+files name and what in the VM answers there (a service, another app, or
+nothing), and how many variables its example env file (`.env.example`,
+`.env.sample`, `.env.template`) names that nothing sets (`--env` lists
+them). An example file lists what an app can read, not what it needs, so
+that count is a hint; whether an app runs is in `skerry status`, which
+says whether each app answers on its ports and, when one doesn't, shows
+the end of its output.
 
 ## `services`
 
@@ -90,8 +163,9 @@ Language toolchains in the VM, as `name` or `name@version`:
 | `bun` | latest | `bun`, `bunx` |
 | `deno` | latest | `deno` |
 
-In Claude Code sessions, a runtime's commands run in the VM only if the
-project lists it; otherwise they run on your machine, as they would
+Without the key, skerry detects them (see above); `runtimes: [node]`
+turns detection off. In Claude Code sessions, a runtime's commands run in
+the VM only if the project has it (listed or detected); otherwise they run on your machine, as they would
 without skerry. Once a workspace has had a runtime, its commands keep
 running in the VM even if `skerry.yaml` stops listing it: code in the VM
 can edit that file, and must not be able to move commands onto your
@@ -105,7 +179,9 @@ then.
 
 ## `packages`
 
-Extra packages from the same signed repository the image is built from
+Every image has git, curl, and a C and C++ toolchain (gcc, make,
+pkg-config) with each runtime's headers (and libpq's, with Postgres), so
+dependencies that compile native code install. Extra packages from the same signed repository the image is built from
 (Wolfi), by name: `ffmpeg`, `imagemagick`, `postgresql-17-contrib`… Up to
 32, and an image's packages may add up to 3 GB at most. Their install
 scripts run in a build VM, never on your machine.
@@ -150,6 +226,49 @@ copies elsewhere, or run those tools in the VM too.
 Paths in the repository (files or folders) whose change re-runs setup, on
 top of the ones skerry always watches (listed above). For example, a
 schema file a migration tool reads: `setup_watch: [db/schema.prisma]`.
+
+## `apps`
+
+Apps never start on their own: preparing a workspace gets its services,
+databases and dependencies ready, and the apps wait until you are ready
+to try a change. `skerry start` runs them (`skerry start web` runs one,
+with the dev watchers of the libraries it uses), and `skerry stop` stops
+them. While they run, they restart if they crash, and again after setup
+runs again (new dependencies, say). Apps that aren't running stay
+stopped. When the VM stops (`skerry down`, or after 30 minutes with no
+commands and no connections to its ports; see `SKERRY_IDLE_STOP`), so do
+the apps, and they wait for `skerry start` again.
+
+Without the key, `skerry start` runs every detected app the repository's
+dev script starts (see above); others run when named
+(`skerry start docs`). List names to choose what it runs, or describe an
+app yourself:
+
+```yaml
+apps:
+  - web                          # a detected app, by name
+  - name: worker
+    dir: services/worker
+    command: yarn start
+    ports: []
+  - name: grpc
+    command: go run ./cmd/grpc
+    ports: [9090]
+    http: false                  # forwarded as plain TCP, not through the proxy
+```
+
+`apps: []` runs none. Apps run in the VM, in their folder, with the
+services' variables, the project's `.venv` if it has one, and their env
+files (which win: they are how the project configures itself). They
+can start once setup has succeeded; after a failed setup,
+`skerry start` says so and waits for `skerry setup`. Each app's ports are forwarded to a port of their own on
+your machine's `127.0.0.1` (the same one each time; `skerry status` shows
+it), through a proxy that shows the app the `Host` it expects
+(`localhost:5173`) and answers only to `localhost` names, so a web page
+can't reach the app through DNS rebinding. They aren't forwarded to the
+app's own port: the VM chooses that port, and could otherwise take one
+your own servers use. `skerry status` shows how each app is doing;
+`skerry logs APP` shows its output.
 
 ## `ports`
 

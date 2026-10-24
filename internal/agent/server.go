@@ -70,6 +70,9 @@ type Server struct {
 	Workspace string
 	touches   touchQueue
 	Log       *log.Logger
+	// NoIPv6 are ports forwarded connections never reach over ::1: the
+	// services', whose servers trust connections from ::1.
+	NoIPv6 map[uint16]bool
 }
 
 // NewServer builds a server that accepts only authorizedKey.
@@ -142,18 +145,17 @@ func (s *Server) directTCPIP(nc ssh.NewChannel) {
 		_ = nc.Reject(ssh.ConnectionFailed, "bad request")
 		return
 	}
-	host := ""
 	switch p.Host {
-	case "127.0.0.1", "localhost":
-		host = "127.0.0.1"
-	case "::1":
-		host = "::1"
-	}
-	if host == "" || p.Port == 0 || p.Port > 65535 {
+	case "127.0.0.1", "localhost", "::1":
+	default:
 		_ = nc.Reject(ssh.Prohibited, "only ports on the guest's loopback interface")
 		return
 	}
-	out, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(p.Port))), 5*time.Second)
+	if p.Port == 0 || p.Port > 65535 {
+		_ = nc.Reject(ssh.Prohibited, "only ports on the guest's loopback interface")
+		return
+	}
+	out, err := dialForwarded(uint16(p.Port), !s.NoIPv6[uint16(p.Port)])
 	if err != nil {
 		_ = nc.Reject(ssh.ConnectionFailed, err.Error())
 		return
@@ -422,4 +424,27 @@ func (q *touchQueue) work() {
 		q.mu.Unlock()
 		touchAll(ws, batch)
 	}
+}
+
+// dialForwarded connects a forwarded connection to a port on the guest's
+// loopback interface. It comes from 127.0.0.2, so services can tell
+// forwarded connections (from the host, which must authenticate) from
+// the VM's own (from 127.0.0.1 or ::1, which are trusted). A server that
+// isn't on 127.0.0.1 is reached over ::1 if ipv6 allows: never one of the
+// services, which trust connections from ::1.
+func dialForwarded(port uint16, ipv6 bool) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: 5 * time.Second, LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2)}}
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	out, err := dialer.Dial("tcp", addr)
+	if err != nil && errors.Is(err, syscall.EADDRNOTAVAIL) {
+		// Not Linux (the agent's tests): no 127.0.0.2.
+		dialer.LocalAddr = nil
+		out, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil && ipv6 && errors.Is(err, syscall.ECONNREFUSED) {
+		// A server listening on ::1 only (Node's "localhost", sometimes).
+		dialer.LocalAddr = nil
+		out, err = dialer.Dial("tcp", net.JoinHostPort("::1", strconv.Itoa(int(port))))
+	}
+	return out, err
 }

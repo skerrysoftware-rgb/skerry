@@ -120,6 +120,89 @@ func cmdDown(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 	return nil
 }
 
+// cmdStart starts the project's apps in a workspace's VM (all of them, or
+// the ones named), starting the VM first if needed: skerry start [-w NAME]
+// [APP...]. Apps run only when asked: a workspace starting (for a Claude
+// Code session, say) prepares its services and dependencies, not them.
+func cmdStart(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	apps, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, true)
+	if err != nil {
+		return err
+	}
+	c, err := v.Up(ctx, ws)
+	if err != nil {
+		return err
+	}
+	c.Close()
+	started, err := v.StartApps(ctx, ws, apps)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "starting %s in %s\n", strings.Join(started, ", "), ws.Name)
+	if st, _, err := v.Status(ws); err == nil {
+		for _, f := range st.Forwards {
+			if slices.Contains(started, f.Name) {
+				where := fmt.Sprintf("127.0.0.1:%d", f.Host)
+				if f.Web {
+					where = services.HostURL(f.Name, st.Hostname, f.Host, "", true)
+				}
+				fmt.Fprintf(env.Stdout, "  %s (port %d in the VM): %s\n", f.Name, f.Guest, where)
+			}
+		}
+	}
+	fmt.Fprintln(env.Stdout, "skerry status shows whether each one answers; skerry logs APP shows its output; skerry stop stops them")
+	return nil
+}
+
+// cmdStop stops apps (all, or the ones named): skerry stop [-w NAME] [APP...].
+func cmdStop(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	name := fs.String("w", "", "workspace name (default: the one containing the current directory)")
+	apps, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	var wsArgs []string
+	if *name != "" {
+		wsArgs = []string{*name}
+	}
+	ws, err := resolveWorkspace(ctx, m, wsArgs, env)
+	if err != nil {
+		return err
+	}
+	v, err := newVMM(env, false)
+	if err != nil {
+		return err
+	}
+	if !v.Running(ws) {
+		fmt.Fprintf(env.Stdout, "%s isn't running, so neither are its apps\n", ws.Name)
+		return nil
+	}
+	if err := v.StopApps(ctx, ws, apps); err != nil {
+		return err
+	}
+	what := "the apps"
+	if len(apps) > 0 {
+		what = strings.Join(apps, ", ")
+	}
+	fmt.Fprintf(env.Stdout, "stopping %s in %s\n", what, ws.Name)
+	return nil
+}
+
 // cmdExec runs a command in a workspace VM: skerry exec [-w NAME] -- CMD...
 func cmdExec(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
@@ -355,6 +438,13 @@ func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env
 		if len(proj.Services) > 0 {
 			fmt.Fprintf(env.Stdout, "services when started: %s (%s)\n", strings.Join(proj.Services, ", "), proj.Source)
 		}
+		if len(proj.Apps) > 0 {
+			var names []string
+			for _, a := range proj.Apps {
+				names = append(names, a.Name)
+			}
+			fmt.Fprintf(env.Stdout, "apps: %s (%s); skerry start runs them\n", strings.Join(names, ", "), proj.AppsSource)
+		}
 		return nil
 	}
 	st, _, err := v.Status(ws)
@@ -367,6 +457,44 @@ func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env
 	}
 	if setup := v.SetupStatus(ws); setup != "" {
 		fmt.Fprintf(env.Stdout, "setup: %s\n", termsafe.Clean(setup))
+	}
+	proj, _ := project.Load(ws.Path)
+	states, err := v.AppStates(ctx, ws)
+	if err == nil && !slices.ContainsFunc(states, func(s agent.AppState) bool { return s.State != "stopped" }) && len(proj.Apps) > 0 {
+		var names []string
+		for _, a := range proj.Apps {
+			if len(a.For) == 0 {
+				names = append(names, a.Name)
+			}
+		}
+		fmt.Fprintf(env.Stdout, "apps: none running; skerry start runs %s\n", strings.Join(names, ", "))
+	}
+	if err == nil && slices.ContainsFunc(states, func(s agent.AppState) bool { return s.State != "stopped" }) {
+		fmt.Fprintln(env.Stdout, "apps:")
+		for _, a := range states {
+			line := fmt.Sprintf("  %s: %s", a.Name, a.State)
+			if len(a.Listening) > 0 {
+				line += ", answering on " + joinPorts(a.Listening)
+			}
+			if len(a.Closed) > 0 {
+				line += ", not answering on " + joinPorts(a.Closed)
+			}
+			if a.Restarts > 0 {
+				line += fmt.Sprintf(" (restarted %d times; last: %s)", a.Restarts, a.LastExit)
+			}
+			fmt.Fprintln(env.Stdout, termsafe.Clean(line))
+			for _, o := range a.Output {
+				fmt.Fprintln(env.Stdout, "    | "+termsafe.Clean(o))
+			}
+			// What its env points at that nothing in the VM serves.
+			if i := slices.IndexFunc(proj.Apps, func(p project.App) bool { return p.Name == a.Name }); i >= 0 {
+				for _, w := range proj.Wiring(proj.Apps[i]) {
+					if w.To == "" {
+						fmt.Fprintf(env.Stdout, "    %s points to localhost:%d, where nothing in the VM listens\n", termsafe.Clean(w.Key), w.Port)
+					}
+				}
+			}
+		}
 	}
 	if snaps, err := v.Snapshots(ws.Repo); err == nil && len(snaps) > 0 {
 		var names []string
@@ -483,9 +611,13 @@ func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 		cmd.Stdout, cmd.Stderr = &termsafe.Writer{W: env.Stdout}, &termsafe.Writer{W: env.Stderr}
 		return cmd.Run()
 	}
-	p, ok := services.Lookup(pos[0])
-	if !ok {
-		return fmt.Errorf("%w: unknown log %q", errUsage, pos[0])
+	logFile := ""
+	if p, ok := services.Lookup(pos[0]); ok {
+		logFile = "/var/log/skerry/" + p.Name + ".log"
+	} else if proj, err := project.Load(ws.Path); err == nil && slices.ContainsFunc(proj.Apps, func(a project.App) bool { return a.Name == pos[0] }) {
+		logFile = "/var/log/skerry/apps/" + pos[0] + ".log"
+	} else {
+		return fmt.Errorf("%w: unknown log %q (a service, an app, setup, console or network)", errUsage, pos[0])
 	}
 	if !v.Running(ws) {
 		return fmt.Errorf("%s is stopped; service logs live in the VM", ws.Name)
@@ -496,7 +628,7 @@ func cmdLogs(ctx context.Context, m *workspace.Manager, args []string, env Env) 
 	}
 	defer c.Close()
 	code, err := c.Run(ctx, agent.Cmd{
-		Args:   append(tail, "/var/log/skerry/"+p.Name+".log"),
+		Args:   append(tail, logFile),
 		Stdout: &termsafe.Writer{W: env.Stdout}, Stderr: &termsafe.Writer{W: env.Stderr},
 	})
 	if err != nil {
@@ -799,5 +931,132 @@ func cmdStatusline(m *workspace.Manager, env Env) error {
 		}
 	}
 	fmt.Fprintln(env.Stdout, termsafe.Clean(line))
+	return nil
+}
+
+func joinPorts(ports []uint16) string {
+	var out []string
+	for _, p := range ports {
+		out = append(out, strconv.Itoa(int(p)))
+	}
+	return strings.Join(out, ", ")
+}
+
+// appPorts describes where an app listens.
+func appPorts(a project.App) string {
+	if len(a.For) > 0 {
+		return "builds for " + strings.Join(a.For, ", ")
+	}
+	what := "port " + joinPorts(a.Ports)
+	if len(a.Ports) == 0 {
+		what = "no port"
+	}
+	for _, p := range a.Taken {
+		what += fmt.Sprintf("; port %d is another app's", p)
+	}
+	return what
+}
+
+// printAppChecks says what an app's env files point to in the VM, and the
+// variables its example env file names that nothing sets: how to tell
+// the apps will find each other and have the configuration they need.
+func printAppChecks(w io.Writer, proj project.Project, a project.App, indent string, listEnv bool) {
+	if len(a.EnvFiles) > 0 {
+		fmt.Fprintf(w, "%senv from %s (%d variables)\n", indent, strings.Join(a.EnvFiles, ", "), len(a.EnvKeys))
+	}
+	for _, wire := range proj.Wiring(a) {
+		to := wire.To
+		if to == "" {
+			to = "nothing in the VM listens there"
+		}
+		fmt.Fprintf(w, "%s%s → localhost:%d: %s\n", indent, wire.Key, wire.Port, to)
+	}
+	// An example env file lists what an app can read, not what it needs:
+	// most have defaults. What it can't do without shows when it runs.
+	switch missing := proj.MissingEnv(a); {
+	case len(missing) == 0:
+	case listEnv:
+		fmt.Fprintf(w, "%snot set, named in an example env file: %s\n", indent, strings.Join(missing, ", "))
+	default:
+		fmt.Fprintf(w, "%s%d variables named in an example env file aren't set (skerry plan --env lists them)\n", indent, len(missing))
+	}
+}
+
+// cmdPlan prints what skerry would set up for the project in DIR (default:
+// the current directory): what it detected or was told, and from where.
+func cmdPlan(args []string, env Env) error {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	listEnv := fs.Bool("env", false, "list the unset variables example env files name")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	dir := "."
+	if len(pos) > 1 {
+		return fmt.Errorf("%w: plan takes at most one folder", errUsage)
+	}
+	if len(pos) == 1 {
+		dir = pos[0]
+	}
+	proj, err := project.Load(dir)
+	if err != nil {
+		return err
+	}
+	w := &termsafe.Writer{W: env.Stdout}
+	or := func(s, none string) string {
+		if s == "" {
+			return none
+		}
+		return s
+	}
+	var runtimes []string
+	for _, r := range proj.Runtimes {
+		runtimes = append(runtimes, r.String())
+	}
+	fmt.Fprintf(w, "services:  %s\n", or(strings.Join(proj.Services, ", "), "none"))
+	if proj.Source != "" {
+		fmt.Fprintf(w, "           (%s)\n", proj.Source)
+	}
+	fmt.Fprintf(w, "runtimes:  %s\n", strings.Join(runtimes, ", "))
+	if proj.RuntimesSource != "" {
+		fmt.Fprintf(w, "           (%s)\n", proj.RuntimesSource)
+	}
+	if len(proj.Packages) > 0 {
+		fmt.Fprintf(w, "packages:  %s\n", strings.Join(proj.Packages, ", "))
+	}
+	for _, a := range proj.PortAliases {
+		fmt.Fprintf(w, "port:      %s also answers on %d, as the project's env files expect\n", a.Service, a.Port)
+	}
+	for _, db := range proj.Databases {
+		fmt.Fprintf(w, "database:  %s (owner %s), from the project's env files\n", db.Name, db.User)
+	}
+	if proj.SeedPostgres != "" {
+		fmt.Fprintf(w, "seed:      %s\n", proj.SeedPostgres)
+	}
+	if len(proj.Setup) == 0 {
+		fmt.Fprintln(w, "setup:     none")
+	} else {
+		fmt.Fprintf(w, "setup:     (%s)\n", proj.SetupSource)
+		for i, s := range proj.Setup {
+			fmt.Fprintf(w, "  %d. %s\n", i+1, s)
+		}
+	}
+	if len(proj.Apps) == 0 {
+		fmt.Fprintln(w, "apps:      none")
+	} else {
+		fmt.Fprintf(w, "apps:      (%s)\n", proj.AppsSource)
+		for _, a := range proj.Apps {
+			fmt.Fprintf(w, "  %-24s %s: %s (%s)\n", a.Name, a.Dir, a.Command, appPorts(a))
+			if len(a.For) == 0 {
+				printAppChecks(w, proj, a, "      ", *listEnv)
+			}
+		}
+	}
+	if len(proj.OtherApps) > 0 {
+		fmt.Fprintln(w, "not started (the repository's dev script or skerry.yaml leaves them out; list them in apps: to run them):")
+		for _, a := range proj.OtherApps {
+			fmt.Fprintf(w, "  %-24s %s: %s (%s)\n", a.Name, a.Dir, a.Command, appPorts(a))
+		}
+	}
 	return nil
 }

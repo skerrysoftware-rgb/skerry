@@ -37,10 +37,10 @@ var runtimes = map[string]Runtime{
 	"python": {
 		Name: "python",
 		Versions: map[string][]string{
-			"3.11": {"python-3.11", "py3.11-pip", "uv"},
-			"3.12": {"python-3.12", "py3.12-pip", "uv"},
-			"3.13": {"python-3.13", "py3.13-pip", "uv"},
-			"3.14": {"python-3.14", "py3.14-pip", "uv"},
+			"3.11": {"python-3.11", "python-3.11-dev", "py3.11-pip", "uv"},
+			"3.12": {"python-3.12", "python-3.12-dev", "py3.12-pip", "uv"},
+			"3.13": {"python-3.13", "python-3.13-dev", "py3.13-pip", "uv"},
+			"3.14": {"python-3.14", "python-3.14-dev", "py3.14-pip", "uv"},
 		},
 		Default:  "3.13",
 		Commands: []string{"python", "python3", "pip", "pip3", "uv", "uvx"},
@@ -59,9 +59,9 @@ var runtimes = map[string]Runtime{
 	"ruby": {
 		Name: "ruby",
 		Versions: map[string][]string{
-			"3.2": {"ruby-3.2", "ruby3.2-bundler"},
-			"3.3": {"ruby-3.3", "ruby3.3-bundler"},
-			"3.4": {"ruby-3.4", "ruby3.4-bundler"},
+			"3.2": {"ruby-3.2", "ruby-3.2-dev", "ruby3.2-bundler"},
+			"3.3": {"ruby-3.3", "ruby-3.3-dev", "ruby3.3-bundler"},
+			"3.4": {"ruby-3.4", "ruby-3.4-dev", "ruby3.4-bundler"},
 		},
 		Default:  "3.4",
 		Commands: []string{"ruby", "gem", "bundle", "irb", "rake"},
@@ -97,6 +97,12 @@ type RuntimeChoice struct {
 }
 
 func (c RuntimeChoice) String() string { return c.Name + "@" + c.Version }
+
+// HasVersion reports whether skerry offers a runtime at a version.
+func HasVersion(name, version string) bool {
+	_, ok := runtimes[name].Versions[version]
+	return ok
+}
 
 // RuntimeNames lists the runtimes skerry offers.
 func RuntimeNames() []string {

@@ -1,6 +1,7 @@
 package vmm
 
 import (
+	"github.com/skerrysoftware-rgb/skerry/internal/project"
 	"testing"
 	"time"
 )
@@ -41,15 +42,15 @@ func TestIdleStopSetting(t *testing.T) {
 func TestResources(t *testing.T) {
 	t.Setenv("SKERRY_CPUS", "2")
 	t.Setenv("SKERRY_MEMORY", "2g")
-	if cpus, mem := resources(); cpus != 2 || mem != 2048 {
-		t.Errorf("resources() = %d, %d", cpus, mem)
+	if cpus, mem := resources(project.Project{}); cpus != 2 || mem != 2048 {
+		t.Errorf("resources(project.Project{}) = %d, %d", cpus, mem)
 	}
 	t.Setenv("SKERRY_MEMORY", "100000g")
-	if _, mem := resources(); mem<<20 > memTotal()/2 && memTotal() > 0 {
+	if _, mem := resources(project.Project{}); mem<<20 > memTotal()/2 && memTotal() > 0 {
 		t.Errorf("memory %d MiB is more than half the machine", mem)
 	}
 	t.Setenv("SKERRY_MEMORY", "512")
-	if _, mem := resources(); mem != MemoryMiB {
+	if _, mem := resources(project.Project{}); mem != MemoryMiB {
 		t.Errorf("a too-small setting was used: %d", mem)
 	}
 }

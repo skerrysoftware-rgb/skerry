@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -22,6 +23,19 @@ func main() {
 		err = agent.Serve()
 	case len(os.Args) == 2 && os.Args[1] == "services":
 		err = agent.RunServices()
+	case len(os.Args) == 2 && os.Args[1] == "apps":
+		err = agent.RunApps()
+	case len(os.Args) >= 2 && os.Args[1] == "apps-start":
+		err = agent.StartApps(os.Args[2:])
+	case len(os.Args) >= 2 && os.Args[1] == "apps-stop":
+		err = agent.StopApps(os.Args[2:])
+	case len(os.Args) == 2 && os.Args[1] == "apps-restart":
+		err = agent.RestartApps()
+	case len(os.Args) == 2 && os.Args[1] == "apps-status":
+		var states []agent.AppState
+		if states, err = agent.AppStates(); err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(states)
+		}
 	case len(os.Args) == 3 && os.Args[1] == "wait":
 		var d time.Duration
 		if d, err = time.ParseDuration(os.Args[2]); err == nil {

@@ -156,6 +156,34 @@ func (g Git) WorktreeIncludes(ctx context.Context, root string) ([]string, error
 	return files, nil
 }
 
+// envFilePatterns are the env files a new workspace gets copies of when
+// the repository has no .worktreeinclude.
+var envFilePatterns = []string{
+	":(glob)**/.env", ":(glob)**/.env.local", ":(glob)**/.env.development", ":(glob)**/.env.development.local",
+}
+
+// IgnoredEnvFiles lists env files (.env, .env.local, .env.development and
+// .env.development.local, in any folder) that git ignores in the checkout
+// at root, outside node_modules: the ones a developer keeps locally.
+func (g Git) IgnoredEnvFiles(ctx context.Context, root string) ([]string, error) {
+	guard, err := g.guard(ctx, root, false)
+	if err != nil {
+		return nil, err
+	}
+	args := append(guard, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--")
+	out, err := g.runInput(ctx, root, nil, append(args, envFilePatterns...)...)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, f := range strings.Split(out, "\x00") {
+		if f != "" && !strings.Contains("/"+f, "/node_modules/") && len(files) < 200 {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
 // cleanEnv drops variables that would point git at a different repository,
 // and stops git from prompting for credentials.
 func cleanEnv(env []string) []string {

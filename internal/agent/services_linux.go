@@ -92,6 +92,9 @@ func runServices(stop <-chan os.Signal) error {
 	if !isMountPoint(dataMount) {
 		return fmt.Errorf("the data disk is not mounted at %s, so services can't keep their data; see skerry logs console", dataMount)
 	}
+	for _, a := range cfg.PortAliases {
+		go relayPort(a)
+	}
 	var all []*service
 	for _, name := range cfg.Services {
 		p, ok := services.Lookup(name)
@@ -277,7 +280,7 @@ func (s *service) setup() error {
 		}
 		data := filepath.Join(s.dir, "data")
 		if _, err := os.Stat(data); err == nil {
-			return nil
+			return writeHBA(data)
 		}
 		// The cluster is made under another name and renamed into place
 		// only when complete, so a stop in the middle (a first boot cut
@@ -299,7 +302,10 @@ func (s *service) setup() error {
 			"\n# skerry\nlisten_addresses = 'localhost'\nunix_socket_directories = '/run/postgresql'\n"); err != nil {
 			return err
 		}
-		return os.Rename(tmp, data)
+		if err := os.Rename(tmp, data); err != nil {
+			return err
+		}
+		return writeHBA(data)
 	case "valkey":
 		conf := strings.Join([]string{
 			"bind 127.0.0.1 -::1",
@@ -532,6 +538,29 @@ func WaitServices(timeout time.Duration) error {
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
+	}
+	return nil
+}
+
+// writeHBA sets who may connect to Postgres. Commands in the VM connect
+// from 127.0.0.1 and are trusted as whatever user they name (they run as
+// root in the VM anyway), so the URLs a project's .env files hold work as
+// written. Connections forwarded from the host arrive from 127.0.0.2 (the
+// agent dials from there) and need the password.
+func writeHBA(data string) error {
+	hba := strings.Join([]string{
+		"# Written by skerry at every start.",
+		"local all all trust",
+		"host  all all 127.0.0.1/32 trust",
+		"host  all all ::1/128 trust",
+		"host  all all all scram-sha-256",
+	}, "\n") + "\n"
+	path := filepath.Join(data, "pg_hba.conf")
+	if err := os.WriteFile(path, []byte(hba), 0o600); err != nil {
+		return err
+	}
+	if uid, gid, ok := lookupUser("postgres"); ok {
+		_ = os.Lchown(path, uid, gid)
 	}
 	return nil
 }

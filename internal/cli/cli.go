@@ -56,6 +56,8 @@ Usage:
   skerry rm <name> [--force]          remove a workspace
   skerry up [name]                    start a workspace's VM
   skerry down [name]                  stop it
+  skerry start [-w name] [APP...]     run the project's apps in its VM (they never start on their own)
+  skerry stop [-w name] [APP...]      stop them
   skerry status [name]                show its services and forwarded ports
   skerry url [-w name] SERVICE        print a URL for a service, for tools on this Mac
   skerry logs [-w name] [-f] [-n N] SERVICE|console|network
@@ -67,6 +69,7 @@ Usage:
                                       save its service data for new workspaces (default)
   skerry gc                           delete images and downloads no workspace needs
   skerry statusline                   one line for Claude Code's status line
+  skerry plan [--env] [DIR]           show what skerry would set up for a project
   skerry exec [-w name] -- CMD...     run a command inside the workspace VM
   skerry enable [DIR] [--yes]         use skerry for checkouts under DIR
   skerry disable [DIR]                stop using skerry under DIR
@@ -131,6 +134,10 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdHook(ctx, m, rest, env)
 	case "up":
 		return cmdUp(ctx, m, rest, env)
+	case "start":
+		return cmdStart(ctx, m, rest, env)
+	case "stop":
+		return cmdStop(ctx, m, rest, env)
 	case "down":
 		return cmdDown(ctx, m, rest, env)
 	case "exec":
@@ -153,6 +160,8 @@ func run(ctx context.Context, args []string, env Env) error {
 		return cmdSeed(ctx, m, rest, env)
 	case "statusline":
 		return cmdStatusline(m, env)
+	case "plan":
+		return cmdPlan(rest, env)
 	case "vm":
 		return cmdVM(ctx, m, rest, env)
 	case "claude":

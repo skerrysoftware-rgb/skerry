@@ -72,8 +72,14 @@ var errSetupFailed = errors.New("setup failed")
 // workspace's current data. Concurrent callers wait for the one that
 // runs them. A failure is recorded rather than retried on every command;
 // skerry setup runs it again.
-func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.Workspace, proj project.Project) error {
-	if len(proj.Setup) == 0 && proj.SeedPostgres == "" {
+func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.Workspace, proj project.Project) (bool, error) {
+	ran := false
+	err := m.runSetup(ctx, c, ws, proj, &ran)
+	return ran, err
+}
+
+func (m *Manager) runSetup(ctx context.Context, c *agent.Client, ws registry.Workspace, proj project.Project, ran *bool) error {
+	if len(proj.Setup) == 0 && proj.SeedPostgres == "" && len(proj.Databases) == 0 {
 		return nil
 	}
 	p, err := m.paths(ws)
@@ -111,8 +117,12 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 
 	// The phase names the step, not the command: the command text is the
 	// repository's, and the phase is shown as skerry's own words.
+	*ran = true
 	steps, step := len(proj.Setup), 0
 	if proj.SeedPostgres != "" {
+		steps++
+	}
+	if len(proj.Databases) > 0 {
 		steps++
 	}
 	run := func(label string, args []string, env map[string]string) error {
@@ -126,7 +136,13 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 		return err
 	}
 	var failure error
-	if proj.SeedPostgres != "" {
+	if len(proj.Databases) > 0 {
+		failure = m.createDatabases(ctx, c, proj.Databases, out, func() {
+			step++
+			m.phase(PhaseSetup, fmt.Sprintf("step %d of %d", step, steps))
+		})
+	}
+	if proj.SeedPostgres != "" && failure == nil {
 		failure = run("seeding postgres from "+proj.SeedPostgres,
 			[]string{"sh", "-c", seedScript}, map[string]string{"SKERRY_SEED": proj.SeedPostgres, agent.EnvNoVenv: "1"})
 	}
@@ -163,6 +179,42 @@ func (m *Manager) ensureSetup(ctx context.Context, c *agent.Client, ws registry.
 	}
 	data, _ := json.Marshal(rec)
 	return fsutil.WriteFileAtomic(p.setup, data, 0o600)
+}
+
+// createDatabaseSQL creates a role and a database owned by it, if they
+// don't exist, with names passed as psql variables (quoted by format's %I,
+// never pasted into SQL).
+const createDatabaseSQL = `SELECT format('CREATE ROLE %I LOGIN', :'u') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'u') \gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'d', :'u') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'d') \gexec
+`
+
+// createDatabases makes the local databases the project's env files point
+// to, so their URLs work as written: commands in the VM are trusted as
+// whatever user they name.
+func (m *Manager) createDatabases(ctx context.Context, c *agent.Client, dbs []project.Database, out io.Writer, step func()) error {
+	step()
+	for _, db := range dbs {
+		fmt.Fprintf(out, "skerry: creating database %s for %s\n", db.Name, db.User)
+		code, err := c.Run(ctx, agent.Cmd{
+			Args: []string{"psql", "-h", "/run/postgresql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+				"-v", "u=" + db.User, "-v", "d=" + db.Name, "-q", "-f", "-"},
+			Env:   map[string]string{agent.EnvNoVenv: "1"},
+			Stdin: strings.NewReader(createDatabaseSQL), Stdout: out, Stderr: out,
+		})
+		if err == nil && code != 0 {
+			err = fmt.Errorf("%w: creating database %s exited with status %d", errSetupFailed, db.Name, code)
+		}
+		if err != nil {
+			return err
+		}
+		// pgvector, as the default database has it.
+		_, _ = c.Run(ctx, agent.Cmd{
+			Args:   []string{"psql", "-h", "/run/postgresql", "-U", "postgres", "-d", db.Name, "-q", "-c", "CREATE EXTENSION IF NOT EXISTS vector"},
+			Env:    map[string]string{agent.EnvNoVenv: "1"},
+			Stdout: out, Stderr: out,
+		})
+	}
+	return nil
 }
 
 // setupInputs is what setup depends on: the project's inputs, and the
@@ -236,6 +288,17 @@ func readSetup(path string) (setupRecord, error) {
 		return rec, err
 	}
 	return rec, json.Unmarshal(data, &rec)
+}
+
+// setupFailed reports whether setup last failed against the workspace's
+// current data and inputs.
+func (m *Manager) setupFailed(ws registry.Workspace) bool {
+	p, err := m.paths(ws)
+	if err != nil {
+		return false
+	}
+	rec, err := readSetup(p.setup)
+	return err == nil && rec.Failed != ""
 }
 
 // SetupStatus describes the last setup run: "" if none has run against the

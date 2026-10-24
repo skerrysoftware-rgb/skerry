@@ -170,7 +170,7 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	if err := m.Git.ExcludeLocally(ctx, root, WorktreesDir+"/"+o.Name, "/"+WorktreesDir+"/"); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
-	if err := m.copyIncludes(ctx, root, path); err != nil {
+	if err := m.copyIncludes(ctx, root, path, mode == registry.ModeSkerry); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 	// Record the git directory now, before any VM can touch the checkout.
@@ -217,10 +217,20 @@ func (m *Manager) worktreeGitDir(ctx context.Context, root, path string) (string
 // copyIncludes copies the main checkout's .worktreeinclude files into a new
 // worktree. Both sides go through os.Root, so a symlink cannot make the copy
 // read or write outside the two checkouts.
-func (m *Manager) copyIncludes(ctx context.Context, root, path string) error {
+func (m *Manager) copyIncludes(ctx context.Context, root, path string, skerryMode bool) error {
 	files, err := m.Git.WorktreeIncludes(ctx, root)
-	if err != nil || len(files) == 0 {
+	if err != nil {
 		return err
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ".worktreeinclude")); errors.Is(statErr, os.ErrNotExist) && skerryMode {
+		// No .worktreeinclude: a workspace still needs the project's local
+		// env files to run its apps, as a developer's checkout has them.
+		if files, err = m.Git.IgnoredEnvFiles(ctx, root); err != nil {
+			return err
+		}
+	}
+	if len(files) == 0 {
+		return nil
 	}
 	src, err := os.OpenRoot(root)
 	if err != nil {

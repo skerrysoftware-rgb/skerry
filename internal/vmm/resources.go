@@ -6,13 +6,20 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/skerrysoftware-rgb/skerry/internal/project"
 )
 
-// resources returns the CPUs and memory for a workspace VM: the defaults,
-// or SKERRY_CPUS and SKERRY_MEMORY ("4096" MiB, or "4g"), kept within what
+// resources returns the CPUs and memory for a workspace VM: by default,
+// enough for what the project runs (its services and apps; the VM only
+// takes memory from the machine as it uses it), or SKERRY_CPUS and
+// SKERRY_MEMORY ("4096" MiB, or "4g"), kept within what
 // this machine can give: at most all its CPUs and half its memory.
-func resources() (cpus uint, memMiB uint64) {
+func resources(proj project.Project) (cpus uint, memMiB uint64) {
 	cpus, memMiB = CPUs, MemoryMiB
+	if need := uint64(2048 + 512*len(proj.Services) + 768*len(proj.Apps)); need > memMiB {
+		memMiB = need
+	}
 	if v := os.Getenv("SKERRY_CPUS"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil || n < 1 {

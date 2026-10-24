@@ -216,9 +216,13 @@ func PID1() error {
 			time.AfterFunc(time.Second, func() { restarts <- c }) // try again
 		}
 	}
+	packageManagerShims()
 	start(&child{role: "serve"})
 	if len(cfg.Services) > 0 {
 		start(&child{role: "services"})
+	}
+	if len(cfg.Apps) > 0 {
+		start(&child{role: "apps"})
 	}
 	for {
 		var ws unix.WaitStatus
@@ -256,8 +260,12 @@ type child struct {
 // shutdown stops the services cleanly, so databases don't need recovery at
 // the next boot, then powers off.
 func shutdown(children map[int]*child) {
-	for pid, c := range children {
-		if c.role == "services" {
+	// Apps first, while the services they use are still up; then services.
+	for _, role := range []string{"apps", "services"} {
+		for pid, c := range children {
+			if c.role != role {
+				continue
+			}
 			_ = unix.Kill(pid, unix.SIGTERM)
 			deadline := time.Now().Add(stopGrace + 4*time.Second)
 			for time.Now().Before(deadline) {
@@ -339,6 +347,25 @@ func Serve() error {
 	srv := NewServer(hostKey, clientKey)
 	srv.Log = logger
 	srv.Env = services.Env(cfg.Services, cfg.Secret)
+	// corepack provides yarn and pnpm at the version package.json asks for;
+	// it must neither stop to ask before downloading one nor edit
+	// package.json.
+	srv.Env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+	srv.Env["COREPACK_ENABLE_AUTO_PIN"] = "0"
+	// uv gives up on a download after 30 seconds without progress, which a
+	// slow patch of network reaches during a large install.
+	srv.Env["UV_HTTP_TIMEOUT"] = "120"
+	srv.NoIPv6 = map[uint16]bool{}
+	for _, name := range cfg.Services {
+		if p, ok := services.Lookup(name); ok {
+			for _, port := range p.Ports {
+				srv.NoIPv6[port.Guest] = true
+			}
+		}
+	}
+	for _, a := range cfg.PortAliases {
+		srv.NoIPv6[a.Port] = true
+	}
 	srv.Workspace = cfg.WorkspacePath
 	// PID 1 stops the services cleanly before powering off.
 	srv.Poweroff = func() { _ = unix.Kill(1, unix.SIGTERM) }

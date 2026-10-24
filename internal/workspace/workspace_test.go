@@ -491,3 +491,31 @@ func TestCanonicalUsesOnDiskCase(t *testing.T) {
 		t.Errorf("Canonical = %s, want %s", got, real)
 	}
 }
+
+func TestEnvFilesCopiedWithoutWorktreeInclude(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	testutil.WriteFile(t, filepath.Join(root, ".gitignore"), ".env\nnode_modules/\n")
+	testutil.Git(t, root, "add", ".gitignore")
+	testutil.Git(t, root, "commit", "--quiet", "-m", "ignore env")
+	testutil.WriteFile(t, filepath.Join(root, "packages", "api", ".env"), "PORT=5183\n")
+	testutil.WriteFile(t, filepath.Join(root, "node_modules", "x", ".env"), "NOPE=1\n")
+	testutil.WriteFile(t, filepath.Join(root, "notes.txt"), "untracked, not ignored\n")
+
+	m := newManager(t)
+	if err := m.Scope.Enable(root); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "with-env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(ws.Path, "packages", "api", ".env")); err != nil || string(data) != "PORT=5183\n" {
+		t.Errorf("the app's .env wasn't copied: %q, %v", data, err)
+	}
+	for _, f := range []string{"node_modules/x/.env", "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(ws.Path, f)); err == nil {
+			t.Errorf("copied %s", f)
+		}
+	}
+}

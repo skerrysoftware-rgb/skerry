@@ -86,13 +86,6 @@ you can see it being prepared (add to `~/.claude/settings.json`):
 "statusLine": { "type": "command", "command": "skerry statusline" }
 ```
 
-### Codex
-
-Codex support is being built. Codex has session hooks but no worktree
-hooks, so skerry will attach a VM to the worktrees Codex makes rather than
-make them itself. Until then, `skerry create NAME` makes a workspace any
-tool can work in, and `skerry exec -- CMD` runs a command in its VM.
-
 ## What happens in a session
 
 1. **Claude creates the worktree through skerry.** In an enabled folder it
@@ -100,9 +93,11 @@ tool can work in, and `skerry exec -- CMD` runs a command in its VM.
    would make it.
 2. **The session opens right away**, and skerry prepares the workspace in
    the background: builds or reuses the VM image, boots the VM (about half a
-   second), starts the services, installs dependencies and runs the setup
-   you configured. The first time for a project this takes a minute or two;
-   after that, seconds.
+   second), starts the services (Postgres, Valkey, Temporal), creates the
+   databases, installs dependencies, builds, and runs the setup you
+   configured. The first time for a project this takes a minute or two;
+   after that, seconds. So the database is there when you run migrations
+   or tests.
 3. **Nothing waits on that but the commands that need the VM.** Claude can
    read and edit code and use git meanwhile. A command that needs the VM
    (`npm test`, say) waits for it, printing each step, and the status line
@@ -112,7 +107,16 @@ tool can work in, and `skerry exec -- CMD` runs a command in its VM.
    other runtime the project lists (`python`, `go`, …). Everything else,
    git included, runs on your machine with your keys and settings. Claude is
    told how the workspace works when the session starts.
-5. **Removing the worktree removes the workspace**: its VM and its data.
+5. **Your apps start when you start them, not before.** Preparing a
+   workspace never runs the project's own apps (its API, web app,
+   workers). When your change is ready to try, run `skerry start` (all of
+   them) or `skerry start web` (one, with the library watchers it needs),
+   or ask Claude to. They run in the VM, restart if they crash, and are
+   forwarded to your machine; `skerry stop` stops them, and so does the
+   VM stopping (`skerry down`, or 30 minutes unused). Running your own
+   dev command (`npm run dev`) works too: it runs in the VM like any
+   other.
+6. **Removing the worktree removes the workspace**: its VM and its data.
    Uncommitted work and branches with commits are never deleted.
 
 ## Configure a project
@@ -122,13 +126,21 @@ already has:
 
 | Service | Started when the project has… | Commands in the VM get |
 |---|---|---|
-| `postgres`: PostgreSQL 17 with pgvector | `pg`, `postgres`, `pg-promise` (npm); `pgx`, `lib/pq` (Go); `psycopg`, `asyncpg` (Python); `pg` (Ruby); a `postgres`/`pgvector` image in a compose file | `DATABASE_URL`, `PG*`; database `app`, with `vector` installed |
+| `postgres`: PostgreSQL 17 with pgvector and the contrib extensions | `pg`, `postgres`, `pg-promise` (npm); `pgx`, `lib/pq` (Go); `psycopg`, `asyncpg` (Python); `pg` (Ruby); a `postgres`/`pgvector` image in a compose file | `DATABASE_URL`, `PG*`; database `app`, with `vector` installed |
 | `valkey`: Valkey 8 (Redis-compatible) | `redis`, `ioredis`, `bullmq`, `iovalkey` (npm); `go-redis`, `valkey-go`; `redis` (Python, Ruby); a `redis`/`valkey` image | `REDIS_URL`, `VALKEY_URL` |
 | `temporal`: Temporal dev server | `@temporalio/client` or `/worker`; `go.temporal.io/sdk`; `temporalio` (Python); a `temporalio/*` image | `TEMPORAL_ADDRESS` |
 
-and installs dependencies from the lockfile it finds (`npm ci`,
-`pnpm install --frozen-lockfile`, `uv sync --frozen`, …). To say exactly
-what a workspace needs, add a `skerry.yaml` at the repository root:
+It also installs dependencies from the lockfile (`npm ci`,
+`pnpm install --frozen-lockfile`, `uv sync --frozen`, …), reads every
+package of a monorepo, carries your local `.env` files into the workspace
+and creates the databases they point to, and builds what the apps import.
+It also finds the project's apps (packages with a `dev` script and a
+port, Procfile processes, Django's and Rails' dev servers), which
+`skerry start` runs, with their ports forwarded to your machine; they
+never start on their own. `skerry plan` shows all of it before anything runs,
+including how each app is wired: what in the VM answers at every local
+address its env files name, and what nothing does. To say exactly what a
+workspace needs, add a `skerry.yaml` at the repository root:
 
 ```yaml
 services: [postgres, temporal]
@@ -137,7 +149,8 @@ packages: [ffmpeg]             # extra packages, by name
 setup:                         # in the VM, in order, when the data is new
   - npm ci
   - npm run migrate
-ports: [3000]                  # forward a dev server to your machine
+apps: [api, web]               # what `skerry start` runs
+ports: [3000]                  # forward another port to your machine
 ```
 
 Setup runs once for a workspace's data, and again when its inputs change
@@ -246,8 +259,15 @@ it.
   through your machine's resolver. Refused connections are logged
   (`skerry logs network`).
 - **Services reachable only from your machine.** Forwarded ports listen on
-  `127.0.0.1` only. Postgres and Valkey each require their own password,
-  which other local users can't read; services without a password aren't
+  `127.0.0.1` only, at ports skerry picks (never ones the checkout names,
+  which could take over ports your own servers use). The apps' web ports
+  answer only to `localhost` names, so a web page can't reach them by DNS
+  rebinding. From your machine, Postgres and Valkey each require
+  their own password, which other local users can't read (inside the VM,
+  where everything runs as root anyway, Postgres trusts the user a
+  command names, so a project's `.env` URLs work unchanged, including on
+  the other ports they may use, which relay to the service inside the VM
+  only); services without a password aren't
   forwarded unless you ask. Output from the VM that skerry prints itself
   (logs, errors) is stripped of terminal control sequences.
 - **Locked git metadata.** The worktree's `.git` pointer is made immutable,
@@ -291,9 +311,13 @@ VM or repository input are fuzzed.
   branch it is on, and code in those VMs can reach the internet. Don't save
   data in a snapshot that you wouldn't give to every branch you check out
   (an outside contributor's included).
-- Setup commands from `skerry.yaml`, and dependency installs, run in the VM
-  without asking when a workspace's data is new or its dependencies change,
-  as `npm install` would.
+- Setup commands from `skerry.yaml`, dependency installs and builds run
+  in the VM without asking, as `npm install` would; the project's apps run
+  when you (or Claude) run `skerry start`.
+- Your local `.env` files (secrets included) are copied into each new
+  workspace, as Claude Code's `.worktreeinclude` copies what it lists, so
+  code in the VM can read them, and the VM can reach the internet. Add a
+  `.worktreeinclude` to choose exactly which files a workspace gets.
 - A VM can reach anything public, from your machine's public address: code
   in it can send what it can read (the checkout) to the internet, and reach
   services that trust your IP address or a public range routed over your
@@ -314,11 +338,13 @@ by hand.
 | `skerry enable [DIR]` / `disable [DIR]`, `enable --list` | Turn skerry on or off for a folder and everything under it |
 | `skerry create NAME [--base BRANCH]` | Make a workspace (worktree on branch `worktree-NAME`) and print its path |
 | `skerry ls` | List workspaces |
-| `skerry status [NAME]` | Show a workspace: preparation, services, setup, forwarded ports |
+| `skerry status [NAME]` | Show a workspace: preparation, services, setup, whether each app answers, forwarded ports |
+| `skerry plan [--env] [DIR]` | Show what skerry would set up for a checkout, and how its apps are wired, without starting anything |
 | `skerry up [NAME]` / `down [NAME]` | Start (and prepare) or stop a workspace's VM |
+| `skerry start [-w NAME] [APP…]` / `stop [-w NAME] [APP…]` | Run or stop the project's apps in the VM (all, or the ones named); they never start on their own |
 | `skerry exec [-w NAME] -- CMD…` | Run a command in the workspace's VM |
 | `skerry url [-w NAME] SERVICE` | Print a URL for a service, for tools on your machine |
-| `skerry logs [-w NAME] [-f] WHAT` | A service's log, or `setup`, `console`, `network` |
+| `skerry logs [-w NAME] [-f] WHAT` | A service's or an app's log, or `setup`, `console`, `network` |
 | `skerry setup [NAME]` | Run the project's seed and setup again |
 | `skerry seed [-w NAME] FILE` | Load a `.sql`, `.sql.gz` or `.dump` file into the workspace's empty Postgres |
 | `skerry snapshot save [S]` / `ls` / `rm S` | Save the workspace's data for new workspaces (`default`); list or delete snapshots |
@@ -331,7 +357,7 @@ Settings, through environment variables for now:
 
 | Variable | Effect |
 |---|---|
-| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused this long (default `30m`; `off` never). The next command starts it again |
+| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused (no commands, no connections to its ports) this long (default `30m`; `off` never), apps included. The next command starts it again; `skerry start` starts the apps again |
 | `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`; at most all CPUs and half the machine's memory) |
 | `SKERRY_BASE=head` | Start new worktrees at your current commit instead of the remote's default branch |
 | `SKERRY_GIT_HOOKS=1` | Let the repository's git hooks run when creating worktrees (off by default) |
@@ -355,12 +381,13 @@ on your machine: skerry raises a file event in the VM for each changed file.
 | ✅ Services: Postgres 17 + pgvector, Valkey, Temporal; data kept per workspace | |
 | ✅ Runtimes: Node, Python, Go, Ruby, Java, Bun, Deno; extra packages by name | |
 | ✅ Dependencies installed from the lockfile; setup re-run when a merge changes them | |
+| ✅ Monorepos: services, apps and library watchers detected across packages; `skerry start` runs apps with forwarded ports | |
+| ✅ Procfiles, Django and Rails dev servers; Python, Ruby and Go runtimes detected | |
+| ✅ Local `.env` files carried into workspaces; the databases they name created | |
 | ✅ Seeds, setup commands (migrations), snapshots cloned per workspace | |
 | ✅ Hot reload; idle stop; CPU and memory limits | |
 | ✅ Images built only from signature-verified packages | |
 | 🚧 Linux hosts | in progress |
-| 🚧 Codex integration | next |
-| 🚧 Cloud and self-hosted runners | later |
 
 ## Building from source
 

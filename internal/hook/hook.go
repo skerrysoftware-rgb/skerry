@@ -231,7 +231,7 @@ func servicesContext(ws registry.Workspace) string {
 		return fmt.Sprintf(" This project's %s is invalid, so the workspace runs no services; `skerry status` shows why.", project.FileName)
 	}
 	if len(proj.Services) == 0 {
-		return setupContext(proj)
+		return setupContext(proj) + appsContext(proj)
 	}
 	var vars []string
 	for k := range services.Env(proj.Services, "x") {
@@ -243,7 +243,26 @@ func servicesContext(ws registry.Workspace) string {
 		" They are set in the environment, so they win over the same names in a .env file (dotenv loaders don't override existing variables)."+
 		" Tools such as psql, valkey-cli and temporal are available through `skerry exec -- <tool>`."+
 		" `skerry status` lists the services and the ports they are forwarded to on this machine.",
-		strings.Join(proj.Services, ", "), proj.Source, strings.Join(vars, ", ")) + setupContext(proj)
+		strings.Join(proj.Services, ", "), proj.Source, strings.Join(vars, ", ")) + setupContext(proj) + appsContext(proj)
+}
+
+// appsContext says the project's apps run in the VM. App names are folder
+// names that passed a strict pattern, so they carry no instructions.
+func appsContext(proj project.Project) string {
+	if len(proj.Apps) == 0 {
+		return ""
+	}
+	var names []string
+	for _, a := range proj.Apps {
+		if len(a.For) == 0 {
+			names = append(names, "`"+a.Name+"`")
+		}
+	}
+	return " The project's apps (" + strings.Join(names, ", ") + ") don't run until someone starts them: `skerry start [app...]`" +
+		" runs them in the VM (restarting them if they crash, and after setup runs again) with their ports forwarded to this machine," +
+		" and `skerry stop` stops them. Start them when the change is ready to try, not before. `skerry status` says whether each" +
+		" one answers on its port and names any variable in its env files that points to a local address nothing in the VM serves;" +
+		" `skerry logs <app>` shows its output."
 }
 
 // setupContext explains the project's setup commands, if it has any.

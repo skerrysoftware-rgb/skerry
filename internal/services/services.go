@@ -46,8 +46,12 @@ type Preset struct {
 
 var presets = map[string]Preset{
 	"postgres": {
-		Name:        "postgres",
-		Packages:    []string{"postgresql-17", "postgresql-17-client", "pgvector-17"},
+		Name: "postgres",
+		// contrib has the extensions projects expect, as the official
+		// image has them (pg_trgm, hstore, citext, uuid-ossp…); the
+		// headers let drivers that compile against libpq (Ruby's pg,
+		// Python's psycopg2) install.
+		Packages:    []string{"postgresql-17", "postgresql-17-client", "postgresql-17-contrib", "postgresql-17-dev", "pgvector-17"},
 		Ports:       []Port{{Name: "postgres", Guest: 5432, Forward: true}},
 		User:        "postgres",
 		UID:         70,

@@ -62,8 +62,27 @@ type Project struct {
 	SeedPostgres string
 	// Runtimes are the language toolchains in the VM; Node is always one.
 	Runtimes []services.RuntimeChoice
+	// RuntimesSource says where Runtimes came from, when not only Node.
+	RuntimesSource string
 	// Packages are extra packages for the VM, by name.
 	Packages []string
+	// Apps are the project's own services, run in the VM once setup is
+	// done: detected (a package with a dev script and a port), or listed.
+	Apps []App
+	// AppsSource says where Apps came from.
+	AppsSource string
+	// OtherApps are detected apps that `skerry start` leaves out unless
+	// named: skerry.yaml or the repository's dev script leaves them out.
+	OtherApps []App
+	// AllApps are every app the VM can run: Apps, OtherApps, and the dev
+	// watchers of either.
+	AllApps []App
+	// Databases are local Postgres databases the project's env files
+	// point to; skerry creates them, with their users.
+	Databases []Database
+	// PortAliases are other ports the services answer on, for the URLs in
+	// the project's env files.
+	PortAliases []PortAlias
 	// SetupWatch are paths (relative to the checkout) whose change makes
 	// setup run again: skerry.yaml, lockfiles, migration folders, and any
 	// the project lists. A merge or rebase that brings new dependencies
@@ -84,14 +103,18 @@ const maxWatch = 32
 type config struct {
 	Services *[]string `yaml:"services"`
 	Ports    []int     `yaml:"ports"`
-	Runtimes []string  `yaml:"runtimes"`
+	Runtimes *[]string `yaml:"runtimes"`
 	Packages []string  `yaml:"packages"`
 	Setup    *[]string `yaml:"setup"`
 	Watch    []string  `yaml:"setup_watch"`
 	Seed     struct {
 		Postgres string `yaml:"postgres"`
 	} `yaml:"seed"`
+	Apps yaml.Node `yaml:"apps"`
 }
+
+// maxVMApps is how many apps a VM runs at most (agent.Config's limit).
+const maxVMApps = 32
 
 // maxPackages bounds a project's extra packages.
 const maxPackages = 32
@@ -104,6 +127,7 @@ func Load(dir string) (Project, error) {
 	var p Project
 	var runtimeSpecs []string
 	var setup *[]string
+	var appsNode *yaml.Node
 	data, err := readLimited(filepath.Join(dir, FileName), maxConfig)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -138,7 +162,12 @@ func Load(dir string) (Project, error) {
 			}
 			setup = c.Setup
 		}
-		runtimeSpecs = c.Runtimes
+		if c.Runtimes != nil {
+			runtimeSpecs, p.RuntimesSource = *c.Runtimes, FileName
+		}
+		if c.Apps.Kind != 0 {
+			appsNode = &c.Apps
+		}
 		if len(c.Watch) > maxWatch {
 			return p, fmt.Errorf("%s: at most %d setup_watch paths", FileName, maxWatch)
 		}
@@ -176,11 +205,71 @@ func Load(dir string) (Project, error) {
 			p.Source = FileName
 		}
 	}
+	scan := scanProject(dir)
 	if p.Source == "" {
 		p.Services, p.Source = Detect(dir)
+		var extra []string
+		if len(scan.packageServices) > 0 {
+			extra = append(extra, fmt.Sprintf("%d workspace packages", len(scan.packages)))
+		}
+		if len(scan.envServices) > 0 {
+			extra = append(extra, ".env files")
+		}
+		for _, s := range append(scan.packageServices, scan.envServices...) {
+			if !slices.Contains(p.Services, s) {
+				p.Services = append(p.Services, s)
+			}
+		}
+		sort.Strings(p.Services)
+		if len(extra) > 0 {
+			if p.Source == "" {
+				p.Source = "detected from " + strings.Join(extra, ", ")
+			} else {
+				p.Source += ", " + strings.Join(extra, ", ")
+			}
+		}
+	}
+	if p.Apps, p.AppsSource, err = appsFrom(appsNode, scan.apps); err != nil {
+		return p, fmt.Errorf("%s: %w", FileName, err)
+	}
+	for _, a := range scan.apps {
+		if len(a.For) == 0 && !slices.ContainsFunc(p.Apps, func(o App) bool { return o.Name == a.Name }) {
+			p.OtherApps = append(p.OtherApps, a)
+		}
+	}
+	// Two apps can't listen on one port: the ones that run come first.
+	taken := map[uint16]bool{}
+	dedupePorts(p.Apps, taken)
+	dedupePorts(p.OtherApps, taken)
+	p.AllApps = append(slices.Clone(p.Apps), p.OtherApps...)
+	for _, w := range scan.apps {
+		if len(w.For) > 0 && !slices.ContainsFunc(p.AllApps, func(o App) bool { return o.Name == w.Name }) {
+			p.AllApps = append(p.AllApps, w)
+		}
+	}
+	// What the VM takes; the apps skerry start runs come first.
+	if len(p.AllApps) > maxVMApps {
+		p.AllApps = p.AllApps[:maxVMApps]
+	}
+	p.Databases = scan.databases
+	switch {
+	case len(p.Databases) == 0 || slices.Contains(p.Services, "postgres"):
+	case p.Source == FileName:
+		p.Databases = nil // skerry.yaml's services leave Postgres out
+	default:
+		p.Services = append(p.Services, "postgres")
+		sort.Strings(p.Services)
+	}
+	for _, a := range scan.aliases {
+		if slices.Contains(p.Services, a.Service) {
+			p.PortAliases = append(p.PortAliases, a)
+		}
 	}
 	if p.SeedPostgres != "" && !slices.Contains(p.Services, "postgres") {
 		return p, fmt.Errorf("%s: seed.postgres needs the postgres service", FileName)
+	}
+	if p.RuntimesSource == "" {
+		runtimeSpecs, p.RuntimesSource = detectRuntimes(dir)
 	}
 	if p.Runtimes, err = services.ParseRuntimes(runtimeSpecs); err != nil {
 		return p, fmt.Errorf("%s: %w", FileName, err)
@@ -189,6 +278,18 @@ func Load(dir string) (Project, error) {
 		p.Setup, p.SetupSource = *setup, FileName
 	} else {
 		p.Setup, p.SetupSource = defaultSetup(dir, p.Runtimes)
+		// What the dev script does first (generating code), then, in a
+		// monorepo, building the packages the apps import.
+		if len(p.Apps) > 0 && len(scan.prelude) > 0 {
+			p.Setup = append(p.Setup, scan.prelude...)
+			p.SetupSource += ", the dev script's first steps"
+		}
+		if len(scan.packages) > 0 && len(p.Apps) > 0 {
+			if build := buildCommand(scan.pm, scan.rootPkg, p.Apps, scan.graph); build != "" {
+				p.Setup = append(p.Setup, build)
+				p.SetupSource += ", and building what the apps use"
+			}
+		}
 	}
 	watch := []string{FileName}
 	if strings.Contains(p.SetupSource, "package.json") {
@@ -231,7 +332,9 @@ const maxFingerprintEntries = 20000
 // a fixed number of entries however large a directory is.
 func (p Project) SetupFingerprint(dir string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "setup %q\nseed %q\n", p.Setup, p.SeedPostgres)
+	// The databases come from env files; a new one runs setup again, an
+	// edit to anything else in those files doesn't.
+	fmt.Fprintf(h, "setup %q\nseed %q\ndatabases %v\n", p.Setup, p.SeedPostgres, p.Databases)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		fmt.Fprintf(h, "unreadable\n")
@@ -332,6 +435,151 @@ func defaultSetup(dir string, runtimes []services.RuntimeChoice) ([]string, stri
 		return nil, ""
 	}
 	return cmds, "inferred from " + strings.Join(from, ", ")
+}
+
+// runtimeManifests are the files that say a project uses a runtime.
+var runtimeManifests = []struct{ runtime, file string }{
+	{"python", "pyproject.toml"}, {"python", "requirements.txt"}, {"python", "uv.lock"},
+	{"python", "Pipfile"}, {"python", "manage.py"},
+	{"ruby", "Gemfile"},
+	{"go", "go.mod"},
+}
+
+var (
+	pythonVersion  = regexp.MustCompile(`(?m)^\s*(3\.\d+)`)
+	rubyVersion    = regexp.MustCompile(`(?m)^\s*(?:ruby-)?(\d+\.\d+)`)
+	goVersion      = regexp.MustCompile(`(?m)^go\s+(1\.\d+)`)
+	requiresPython = regexp.MustCompile(`requires-python\s*=\s*["'][^"']*?(?:>=|~=|==|\^)\s*(3\.\d+)`)
+)
+
+// detectRuntimes finds the runtimes a project without a runtimes key
+// uses, from its manifests at the root, at the version it pins
+// (.python-version, requires-python, .ruby-version, go.mod's go line)
+// when skerry offers it, else at the default.
+func detectRuntimes(dir string) ([]string, string) {
+	var specs, from []string
+	version := func(file string, re *regexp.Regexp) string {
+		data, err := readLimited(filepath.Join(dir, file), maxScan)
+		if err != nil {
+			return ""
+		}
+		if m := re.FindSubmatch(data); m != nil {
+			return string(m[1])
+		}
+		return ""
+	}
+	for _, m := range runtimeManifests {
+		if slices.ContainsFunc(specs, func(s string) bool { return strings.HasPrefix(s, m.runtime) }) {
+			continue
+		}
+		if info, err := os.Lstat(filepath.Join(dir, m.file)); err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		var v string
+		switch m.runtime {
+		case "python":
+			if v = version(".python-version", pythonVersion); v == "" {
+				v = version("pyproject.toml", requiresPython)
+			}
+		case "ruby":
+			v = version(".ruby-version", rubyVersion)
+		case "go":
+			v = version("go.mod", goVersion)
+		}
+		spec := m.runtime
+		if v != "" && services.HasVersion(m.runtime, v) {
+			spec += "@" + v
+		}
+		specs, from = append(specs, spec), append(from, m.file)
+	}
+	if len(specs) == 0 {
+		return nil, ""
+	}
+	return specs, "detected from " + strings.Join(from, ", ")
+}
+
+// AppNames is what `skerry start NAME...` runs: the named apps (or, with
+// none, Apps), and the dev watchers that build for them.
+func (p Project) AppNames(names []string) ([]string, error) {
+	if len(names) == 0 {
+		for _, a := range p.Apps {
+			if len(a.For) == 0 {
+				names = append(names, a.Name)
+			}
+		}
+	}
+	out := slices.Clone(names)
+	for _, n := range names {
+		if !slices.ContainsFunc(p.AllApps, func(a App) bool { return a.Name == n }) {
+			var known []string
+			for _, a := range p.AllApps {
+				known = append(known, a.Name)
+			}
+			return nil, fmt.Errorf("no app named %q (apps: %s)", n, strings.Join(known, ", "))
+		}
+	}
+	for _, w := range p.AllApps {
+		if slices.ContainsFunc(w.For, func(f string) bool { return slices.Contains(names, f) }) && !slices.Contains(out, w.Name) {
+			out = append(out, w.Name)
+		}
+	}
+	return out, nil
+}
+
+// Wire is where one of an app's local addresses leads.
+type Wire struct {
+	Key  string
+	Port uint16
+	// To is the service or app listening there, or "" if nothing in the
+	// VM does.
+	To string
+}
+
+// Wiring says, for each local address an app's env names, what in the VM
+// answers there: how the apps reach the services and each other.
+func (p Project) Wiring(a App) []Wire {
+	owner := map[uint16]string{}
+	for _, name := range p.Services {
+		if preset, ok := services.Lookup(name); ok {
+			for _, port := range preset.Ports {
+				owner[port.Guest] = name
+			}
+		}
+	}
+	for _, a := range p.PortAliases {
+		owner[a.Port] = a.Service
+	}
+	for _, o := range p.Apps {
+		for _, port := range o.Ports {
+			if _, ok := owner[port]; !ok {
+				owner[port] = o.Name
+			}
+		}
+	}
+	var out []Wire
+	for _, r := range a.Refs {
+		out = append(out, Wire{Key: r.Key, Port: r.Port, To: owner[r.Port]})
+	}
+	return out
+}
+
+// MissingEnv lists the variables the project's example env files name for
+// an app that neither its env files nor its services set.
+func (p Project) MissingEnv(a App) []string {
+	have := map[string]bool{}
+	for _, k := range a.EnvKeys {
+		have[k] = true
+	}
+	for k := range services.Env(p.Services, "") {
+		have[k] = true
+	}
+	var out []string
+	for _, k := range a.Expected {
+		if !have[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // detector maps a file's contents to the services it implies.

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,8 +47,13 @@ import (
 )
 
 // Packages every workspace image gets; runtimes (Node always among them),
-// services and the project's own extra packages add theirs.
-var Packages = []string{"curl"}
+// services and the project's own extra packages add theirs. Package
+// managers fetch dependencies pinned to git URLs with git (the checkout's
+// git metadata isn't in the VM, so git there sees no repository), and
+// compile native modules (node-gyp, Python source packages, Ruby gems)
+// with a C and C++ toolchain; build-base also brings make, which
+// Procfiles and setup scripts often run.
+var Packages = []string{"curl", "git", "build-base"}
 
 // ImagePackages lists the packages a project's image needs, runtimes first
 // so that a runtime's version is the one later packages resolve against.
@@ -393,6 +399,18 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 			Gateway: netx.GatewayIP, DNS: netx.GatewayIP,
 		},
 	}
+	for _, a := range proj.AllApps {
+		app := agent.App{Name: a.Name, Dir: filepath.Join(ws.Path, filepath.FromSlash(a.Dir)), Command: a.Command, Ports: a.Ports}
+		for _, f := range a.EnvFiles {
+			app.EnvFiles = append(app.EnvFiles, filepath.Join(ws.Path, filepath.FromSlash(f)))
+		}
+		cfg.Apps = append(cfg.Apps, app)
+	}
+	for _, a := range proj.PortAliases {
+		if preset, ok := services.Lookup(a.Service); ok {
+			cfg.PortAliases = append(cfg.PortAliases, agent.PortAlias{Port: a.Port, To: preset.Ports[0].Guest})
+		}
+	}
 	dataDisk := ""
 	if len(proj.Services) > 0 {
 		if cfg.Secret, err = secret(p.secret); err != nil {
@@ -436,7 +454,7 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 	defer stopNet()
 	network.Attach(netCtx, hostNet)
 
-	cpus, memMiB := resources()
+	cpus, memMiB := resources(proj)
 	vm, err := engine.Start(engine.Config{
 		Kernel: img.Kernel, Initramfs: img.Initramfs, Rootfs: img.Rootfs,
 		ConfigDir: p.share, WorkDir: ws.Path, CPUs: cpus, MemoryMiB: memMiB,
@@ -448,7 +466,7 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 		return err
 	}
 	act := newActivity()
-	dialer := &guestDialer{vm: vm, keys: keys, open: map[net.Conn]bool{}, act: act}
+	dialer := &guestDialer{vm: vm, keys: keys, open: map[net.Conn]bool{}, act: act, own: hostname(ws.Name) + ".localhost"}
 	defer dialer.close()
 	forwards, closeForwards := m.forward(dialer, p, proj)
 	defer closeForwards()
@@ -626,7 +644,13 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 	if err == nil {
 		m.noteRuntimes(ws, proj)
 		m.warnStaleImage(ws, proj)
-		err = m.ensureSetup(ctx, c, ws, proj)
+		var ran bool
+		ran, err = m.ensureSetup(ctx, c, ws, proj)
+		// Apps that are running restart on what setup installed; the
+		// others stay stopped until someone starts them.
+		if err == nil && ran && len(proj.AllApps) > 0 && !m.setupFailed(ws) {
+			err = m.appsCommand(ctx, c, "apps-restart")
+		}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -641,6 +665,95 @@ func (m *Manager) Up(ctx context.Context, ws registry.Workspace) (*agent.Client,
 		m.phase(PhaseReady, "")
 	}
 	return c, nil
+}
+
+// maxForwards bounds the ports forwarded for one workspace.
+const maxForwards = 48
+
+// appsCommand asks the VM's app supervisor to start, stop or restart
+// apps.
+func (m *Manager) appsCommand(ctx context.Context, c *agent.Client, cmd string, names ...string) error {
+	out := &limitedBuffer{max: 4 << 10}
+	code, err := c.Run(ctx, agent.Cmd{Args: append([]string{"/.skerry/agent", cmd}, names...), Stdout: out, Stderr: out})
+	if err == nil && code != 0 {
+		err = fmt.Errorf("%s", strings.TrimSpace(out.String()))
+	}
+	return err
+}
+
+// StartApps starts apps in a running workspace (all of the project's, if
+// none are named), with the dev watchers they use, once setup has
+// succeeded: apps need what it installs.
+func (m *Manager) StartApps(ctx context.Context, ws registry.Workspace, names []string) ([]string, error) {
+	proj, err := project.Load(ws.Path)
+	if err != nil {
+		return nil, err
+	}
+	if names, err = proj.AppNames(names); err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, errors.New("the project has no apps skerry knows how to run (skerry plan shows what it found)")
+	}
+	if m.setupFailed(ws) {
+		return nil, errors.New("setup failed, so the apps can't start; see skerry logs setup, and rerun it with skerry setup")
+	}
+	c, err := m.Connect(ws)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	return names, m.appsCommand(ctx, c, "apps-start", names...)
+}
+
+// StopApps stops apps (all, if none are named), and the dev watchers no
+// app still running needs.
+func (m *Manager) StopApps(ctx context.Context, ws registry.Workspace, names []string) error {
+	if len(names) > 0 {
+		proj, err := project.Load(ws.Path)
+		if err != nil {
+			return err
+		}
+		states, err := m.AppStates(ctx, ws)
+		if err != nil {
+			return err
+		}
+		running := func(name string) bool {
+			return !slices.Contains(names, name) && slices.ContainsFunc(states, func(s agent.AppState) bool {
+				return s.Name == name && s.State != "stopped"
+			})
+		}
+		for _, w := range proj.AllApps {
+			if len(w.For) > 0 && !slices.Contains(names, w.Name) && !slices.ContainsFunc(w.For, running) {
+				names = append(names, w.Name)
+			}
+		}
+	}
+	c, err := m.Connect(ws)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return m.appsCommand(ctx, c, "apps-stop", names...)
+}
+
+// AppStates asks the VM how the project's apps are doing.
+func (m *Manager) AppStates(ctx context.Context, ws registry.Workspace) ([]agent.AppState, error) {
+	c, err := m.Connect(ws)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	out := &limitedBuffer{max: 256 << 10}
+	code, err := c.Run(ctx, agent.Cmd{Args: []string{"/.skerry/agent", "apps-status"}, Stdout: out})
+	if err != nil || code != 0 {
+		return nil, fmt.Errorf("asking the VM for its apps: %v", err)
+	}
+	var states []agent.AppState
+	if err := json.Unmarshal([]byte(out.String()), &states); err != nil {
+		return nil, err
+	}
+	return states, nil
 }
 
 // warnStaleImage says when skerry.yaml asks for runtimes, services or
@@ -1064,6 +1177,14 @@ func (m *Manager) forward(d *guestDialer, p wsPaths, proj project.Project) ([]Fo
 		}
 		want = append(want, f)
 	}
+	for _, a := range proj.AllApps {
+		for _, port := range a.Ports {
+			want = append(want, Forward{Name: a.Name, Guest: port, Web: !a.NotHTTP})
+		}
+	}
+	if len(want) > maxForwards {
+		want = want[:maxForwards]
+	}
 	previous := map[uint16]uint16{}
 	if data, err := os.ReadFile(p.status + ".ports"); err == nil {
 		_ = json.Unmarshal(data, &previous)
@@ -1078,9 +1199,20 @@ func (m *Manager) forward(d *guestDialer, p wsPaths, proj project.Project) ([]Fo
 			continue
 		}
 		seen[f.Guest] = true
-		l, err := d.listen(previous[f.Guest], f.Guest)
-		if err != nil && previous[f.Guest] != 0 {
-			l, err = d.listen(0, f.Guest)
+		listen := d.listen
+		if f.Web {
+			listen = d.listenWeb
+		}
+		// The port it had last time, else any. Never one the checkout names
+		// (an app's own 3000, say): the VM could then pick a port the
+		// user's own servers use on this Mac, and take their traffic.
+		var l net.Listener
+		err := errors.New("no port")
+		if port := previous[f.Guest]; port != 0 && port != f.Guest {
+			l, err = listen(port, f.Guest)
+		}
+		if err != nil {
+			l, err = listen(0, f.Guest)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "forward %s: %v\n", f.Name, err)

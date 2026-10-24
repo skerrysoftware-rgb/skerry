@@ -247,7 +247,8 @@ services a project needs.
 
 Workspaces run untrusted code: dependencies' install scripts, repository
 scripts, and whatever an agent decides to run. skerry is built to contain
-it.
+it. Found a way out? Please report it privately, as
+[SECURITY.md](SECURITY.md) describes.
 
 **What protects you**
 

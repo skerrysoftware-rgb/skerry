@@ -156,16 +156,16 @@ func (g Git) WorktreeIncludes(ctx context.Context, root string) ([]string, error
 	return files, nil
 }
 
-// envFilePatterns are the env files a new workspace gets copies of when
-// the repository has no .worktreeinclude.
+// envFilePatterns are the env files a developer commonly keeps locally.
 var envFilePatterns = []string{
 	":(glob)**/.env", ":(glob)**/.env.local", ":(glob)**/.env.development", ":(glob)**/.env.development.local",
 }
 
-// IgnoredEnvFiles lists env files (.env, .env.local, .env.development and
-// .env.development.local, in any folder) that git ignores in the checkout
-// at root, outside node_modules: the ones a developer keeps locally.
-func (g Git) IgnoredEnvFiles(ctx context.Context, root string) ([]string, error) {
+// LocalEnvFiles lists, by path, the env files (.env, .env.local,
+// .env.development, .env.development.local, in any folder outside
+// node_modules) that git ignores in the checkout at root. Their contents
+// are never read.
+func (g Git) LocalEnvFiles(ctx context.Context, root string) ([]string, error) {
 	guard, err := g.guard(ctx, root, false)
 	if err != nil {
 		return nil, err

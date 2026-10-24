@@ -165,6 +165,7 @@ func cmdStart(ctx context.Context, m *workspace.Manager, args []string, env Env)
 		}
 	}
 	fmt.Fprintln(env.Stdout, "skerry status shows whether each one answers; skerry logs APP shows its output; skerry stop stops them")
+	printEnvHint(ctx, m, env.Stdout, ws.Repo)
 	return nil
 }
 
@@ -459,6 +460,9 @@ func cmdStatus(ctx context.Context, m *workspace.Manager, args []string, env Env
 		fmt.Fprintf(env.Stdout, "setup: %s\n", termsafe.Clean(setup))
 	}
 	proj, _ := project.Load(ws.Path)
+	if len(proj.AllApps) > 0 {
+		defer printEnvHint(ctx, m, env.Stdout, ws.Repo)
+	}
 	states, err := v.AppStates(ctx, ws)
 	if err == nil && !slices.ContainsFunc(states, func(s agent.AppState) bool { return s.State != "stopped" }) && len(proj.Apps) > 0 {
 		var names []string
@@ -942,6 +946,29 @@ func joinPorts(ports []uint16) string {
 	return strings.Join(out, ", ")
 }
 
+// printEnvHint says which of the main checkout's env files workspaces
+// don't get, and how to share them: skerry never copies env files, so an
+// app that needs one won't start until the repository's .worktreeinclude
+// lists it. Paths only; contents are never read.
+func printEnvHint(ctx context.Context, m *workspace.Manager, w io.Writer, repo string) {
+	files, err := m.UnsharedEnvFiles(ctx, repo)
+	if err != nil || len(files) == 0 {
+		return
+	}
+	shown := files
+	if len(shown) > 6 {
+		shown = shown[:6]
+	}
+	more := ""
+	if len(files) > len(shown) {
+		more = fmt.Sprintf(" and %d more", len(files)-len(shown))
+	}
+	fmt.Fprintf(w, "env files: workspaces don't get %s%s from your checkout.\n", termsafe.Clean(strings.Join(shown, ", ")), more)
+	fmt.Fprintln(w, "  skerry never copies env files, which often hold secrets. If the apps need them, list them in")
+	fmt.Fprintln(w, "  .worktreeinclude at the repository root (patterns like .gitignore; **/.env covers every folder's);")
+	fmt.Fprintln(w, "  new workspaces then get copies, which code in their VM can read.")
+}
+
 // appPorts describes where an app listens.
 func appPorts(a project.App) string {
 	if len(a.For) > 0 {
@@ -984,7 +1011,7 @@ func printAppChecks(w io.Writer, proj project.Project, a project.App, indent str
 
 // cmdPlan prints what skerry would set up for the project in DIR (default:
 // the current directory): what it detected or was told, and from where.
-func cmdPlan(args []string, env Env) error {
+func cmdPlan(ctx context.Context, m *workspace.Manager, args []string, env Env) error {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	listEnv := fs.Bool("env", false, "list the unset variables example env files name")
 	pos, err := parse(fs, args)
@@ -1056,6 +1083,16 @@ func cmdPlan(args []string, env Env) error {
 		fmt.Fprintln(w, "not started (the repository's dev script or skerry.yaml leaves them out; list them in apps: to run them):")
 		for _, a := range proj.OtherApps {
 			fmt.Fprintf(w, "  %-24s %s: %s (%s)\n", a.Name, a.Dir, a.Command, appPorts(a))
+		}
+	}
+	// The repository a workspace belongs to, or the checkout itself.
+	repo := dir
+	if ws, err := m.Find(dir); err == nil {
+		repo = ws.Repo
+	}
+	if abs, err := filepath.Abs(repo); err == nil {
+		if _, err := os.Lstat(filepath.Join(abs, ".git")); err == nil {
+			printEnvHint(ctx, m, w, abs)
 		}
 	}
 	return nil

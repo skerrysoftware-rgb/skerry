@@ -11,8 +11,9 @@ runs has your whole machine within reach.
 
 skerry gives each worktree its own small Linux VM, with its own processes,
 ports, Postgres, Valkey (Redis) and Temporal, and its own copy of their data.
-It reads what it needs from the repository (lockfiles, `.env` files, compose
-files, monorepo packages), so most projects need no configuration. It plugs
+It reads what it needs from the repository (lockfiles, compose files,
+monorepo packages, the local addresses its env files name), so most
+projects need no configuration. It plugs
 into Claude Code, so every worktree session gets one automatically and the
 VM is ready in the background while the session gets on with the work; with
 any other tool, `skerry create` makes a workspace by hand.
@@ -172,8 +173,13 @@ already has:
 
 It also installs dependencies from the lockfile (`npm ci`,
 `pnpm install --frozen-lockfile`, `uv sync --frozen`, …), reads every
-package of a monorepo, carries your local `.env` files into the workspace
-and creates the databases they point to, and builds what the apps import.
+package of a monorepo, creates the local databases the project's env files
+point to, and builds what the apps import. Env files are read on your
+machine for their shape only (local addresses, ports, variable names):
+skerry never stores, prints, sends or copies their values. A workspace
+gets your `.env` files only if the repository's `.worktreeinclude` lists
+them (`**/.env` covers every folder's); `skerry plan` tells you which
+ones your workspaces are missing.
 It also finds the project's apps (packages with a `dev` script and a
 port, Procfile processes, Django's and Rails' dev servers), which
 `skerry start` runs, with their ports forwarded to your machine; they
@@ -334,10 +340,11 @@ VM or repository input are fuzzed.
 - Setup commands from `skerry.yaml`, dependency installs and builds run
   in the VM without asking, as `npm install` would; the project's apps run
   when you (or Claude) run `skerry start`.
-- Your local `.env` files (secrets included) are copied into each new
-  workspace, as Claude Code's `.worktreeinclude` copies what it lists, so
-  code in the VM can read them, and the VM can reach the internet. Add a
-  `.worktreeinclude` to choose exactly which files a workspace gets.
+- Files a repository's `.worktreeinclude` lists (a `.env`, say) are
+  copied into each new workspace, as Claude Code copies them, so code in
+  the VM can read them, and the VM can reach the internet. Without one,
+  a workspace gets no env files, and an app that needs one won't start
+  until you add it.
 - A VM can reach anything public, from your machine's public address: code
   in it can send what it can read (the checkout) to the internet, and reach
   services that trust your IP address or a public range routed over your
@@ -409,7 +416,7 @@ Settings, through environment variables for now:
 | ✅ Dependencies installed from the lockfile; setup re-run when a merge changes them | |
 | ✅ Monorepos: services, apps and library watchers detected across packages; `skerry start` runs apps with forwarded ports | |
 | ✅ Procfiles, Django and Rails dev servers; Python, Ruby and Go runtimes detected | |
-| ✅ Local `.env` files carried into workspaces; the databases they name created | |
+| ✅ Local databases the project's env files name, created; env file values never read for anything else | |
 | ✅ Seeds, setup commands (migrations), snapshots cloned per workspace | |
 | ✅ Hot reload; idle stop; CPU and memory limits | |
 | ✅ Images built only from signature-verified packages | |

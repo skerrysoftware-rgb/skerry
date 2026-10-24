@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -170,7 +171,7 @@ func (m *Manager) Create(ctx context.Context, o CreateOptions) (registry.Workspa
 	if err := m.Git.ExcludeLocally(ctx, root, WorktreesDir+"/"+o.Name, "/"+WorktreesDir+"/"); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
-	if err := m.copyIncludes(ctx, root, path, mode == registry.ModeSkerry); err != nil {
+	if err := m.copyIncludes(ctx, root, path); err != nil {
 		return registry.Workspace{}, m.rollback(ctx, root, path, branch, err)
 	}
 	// Record the git directory now, before any VM can touch the checkout.
@@ -217,20 +218,10 @@ func (m *Manager) worktreeGitDir(ctx context.Context, root, path string) (string
 // copyIncludes copies the main checkout's .worktreeinclude files into a new
 // worktree. Both sides go through os.Root, so a symlink cannot make the copy
 // read or write outside the two checkouts.
-func (m *Manager) copyIncludes(ctx context.Context, root, path string, skerryMode bool) error {
+func (m *Manager) copyIncludes(ctx context.Context, root, path string) error {
 	files, err := m.Git.WorktreeIncludes(ctx, root)
-	if err != nil {
+	if err != nil || len(files) == 0 {
 		return err
-	}
-	if _, statErr := os.Lstat(filepath.Join(root, ".worktreeinclude")); errors.Is(statErr, os.ErrNotExist) && skerryMode {
-		// No .worktreeinclude: a workspace still needs the project's local
-		// env files to run its apps, as a developer's checkout has them.
-		if files, err = m.Git.IgnoredEnvFiles(ctx, root); err != nil {
-			return err
-		}
-	}
-	if len(files) == 0 {
-		return nil
 	}
 	src, err := os.OpenRoot(root)
 	if err != nil {
@@ -462,6 +453,29 @@ func (m *Manager) checkNoWork(ctx context.Context, ws registry.Workspace) error 
 }
 
 // Find returns the workspace containing path.
+// UnsharedEnvFiles lists the env files in the main checkout at repo that
+// new workspaces don't get: skerry never copies env files (they often hold
+// secrets, which code in a VM could read), and the repository's
+// .worktreeinclude doesn't list them. Only paths are listed; contents are
+// never read.
+func (m *Manager) UnsharedEnvFiles(ctx context.Context, repo string) ([]string, error) {
+	local, err := m.Git.LocalEnvFiles(ctx, repo)
+	if err != nil || len(local) == 0 {
+		return nil, err
+	}
+	shared, err := m.Git.WorktreeIncludes(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, f := range local {
+		if !slices.Contains(shared, f) {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
 func (m *Manager) Find(path string) (registry.Workspace, error) {
 	p, err := Canonical(path)
 	if err != nil {

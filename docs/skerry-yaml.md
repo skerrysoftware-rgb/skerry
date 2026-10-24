@@ -79,16 +79,22 @@ migration tools are.
 - **Monorepos.** It reads every workspace package (npm, Yarn and Bun
   `workspaces`, `pnpm-workspace.yaml`), not just the root.
 - **Services** from the packages' dependencies, compose files, `go.mod`,
-  Python and Ruby manifests, and local URLs in `.env` files
+  Python and Ruby manifests, and local addresses in env files
   (`postgres://…@localhost`, `redis://localhost`, a Temporal address on
   `:7233`).
-- **Env files.** A new workspace gets copies of the `.env`, `.env.local`,
-  `.env.development` and `.env.development.local` files git ignores in your
-  main checkout (outside `node_modules`), as a developer's checkout has
-  them. A repository with a `.worktreeinclude` gets exactly what that
-  lists instead.
+- **Env files, never their secrets.** skerry reads the checkout's env
+  files on your machine for their shape only: local addresses
+  (`localhost:5183`, `postgres://…@localhost/mydb`), port numbers, and
+  variable names. It never stores, prints or sends their values, and never
+  copies them anywhere: a new workspace gets your env files only if the
+  repository's `.worktreeinclude` lists them (Claude Code's own way of
+  choosing what a worktree gets), and they are then readable by code in
+  that workspace's VM. `skerry plan`, `skerry start` and `skerry status`
+  name the env files in your checkout that workspaces don't get, and the
+  line to add (`**/.env` covers every folder's).
 - **Databases.** Every local Postgres database those files point to is
-  created, owned by the user the URL names, so the URLs work unchanged:
+  created, owned by the user the URL names (with no password: inside the
+  VM, local connections are trusted), so the URLs work unchanged:
   `postgresql://user:pass@localhost:5432/mydb` finds `mydb`. So is the
   database a compose file's Postgres service is told to create
   (`POSTGRES_USER`, `POSTGRES_DB`), which the project's settings often

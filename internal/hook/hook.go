@@ -181,7 +181,7 @@ func (h *Handler) sessionStart(in Input) error {
 			" The workspace is being prepared in the background (its image, services and dependencies), which can take a few minutes the first time;"+
 			" this session isn't blocked by it: edit files and use git as usual. Commands that run in the VM wait for it and print each step,"+
 			" and `skerry status` shows where it is.",
-			ws.Name, ws.Path, ws.Branch, vmCommands(ws)) + servicesContext(ws) + warnings
+			ws.Name, ws.Path, ws.Branch, vmCommands(ws)) + servicesContext(ws) + h.envContext(ws) + warnings
 	} else {
 		// A plain worktree: say once per repository that skerry is
 		// available, then stay out of the way.
@@ -200,6 +200,19 @@ func (h *Handler) sessionStart(in Input) error {
 			"additionalContext": context,
 		},
 	})
+}
+
+// envContext says, when the main checkout has env files this workspace
+// didn't get, how they are shared. Only a count: file names come from the
+// checkout, and their contents are never read.
+func (h *Handler) envContext(ws registry.Workspace) string {
+	files, err := h.Manager.UnsharedEnvFiles(context.Background(), ws.Repo)
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" The main checkout has %d env file(s) this workspace didn't get: skerry never copies env files, which often hold secrets."+
+		" If the project's apps need them, tell the user; they share them by listing them in .worktreeinclude at the repository root"+
+		" (new workspaces then get copies, which code in the VM can read). Don't copy them yourself. `skerry plan` lists them.", len(files))
 }
 
 // vmCommands lists, in backquotes, the commands that run in the VM for

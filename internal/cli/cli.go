@@ -161,7 +161,7 @@ func run(ctx context.Context, args []string, env Env) error {
 	case "statusline":
 		return cmdStatusline(m, env)
 	case "plan":
-		return cmdPlan(rest, env)
+		return cmdPlan(ctx, m, rest, env)
 	case "vm":
 		return cmdVM(ctx, m, rest, env)
 	case "claude":

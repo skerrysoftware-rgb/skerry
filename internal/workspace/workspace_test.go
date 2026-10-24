@@ -492,30 +492,50 @@ func TestCanonicalUsesOnDiskCase(t *testing.T) {
 	}
 }
 
-func TestEnvFilesCopiedWithoutWorktreeInclude(t *testing.T) {
+// A workspace never gets the main checkout's env files (secrets, often)
+// unless the repository's .worktreeinclude lists them: they would be
+// readable by code in the VM, and by the agent working in the worktree.
+func TestEnvFilesNotCopiedWithoutWorktreeInclude(t *testing.T) {
 	ctx := context.Background()
 	root := testutil.NewRepo(t)
-	testutil.WriteFile(t, filepath.Join(root, ".gitignore"), ".env\nnode_modules/\n")
+	testutil.WriteFile(t, filepath.Join(root, ".gitignore"), ".env\n")
 	testutil.Git(t, root, "add", ".gitignore")
 	testutil.Git(t, root, "commit", "--quiet", "-m", "ignore env")
+	testutil.WriteFile(t, filepath.Join(root, ".env"), "API_KEY=secret\n")
 	testutil.WriteFile(t, filepath.Join(root, "packages", "api", ".env"), "PORT=5183\n")
-	testutil.WriteFile(t, filepath.Join(root, "node_modules", "x", ".env"), "NOPE=1\n")
-	testutil.WriteFile(t, filepath.Join(root, "notes.txt"), "untracked, not ignored\n")
 
 	m := newManager(t)
 	if err := m.Scope.Enable(root); err != nil {
 		t.Fatal(err)
 	}
-	ws, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "with-env"})
+	ws, err := m.Create(ctx, workspace.CreateOptions{From: root, Name: "no-env"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(filepath.Join(ws.Path, "packages", "api", ".env")); err != nil || string(data) != "PORT=5183\n" {
-		t.Errorf("the app's .env wasn't copied: %q, %v", data, err)
-	}
-	for _, f := range []string{"node_modules/x/.env", "notes.txt"} {
+	for _, f := range []string{".env", "packages/api/.env"} {
 		if _, err := os.Stat(filepath.Join(ws.Path, f)); err == nil {
 			t.Errorf("copied %s", f)
 		}
+	}
+}
+
+func TestUnsharedEnvFiles(t *testing.T) {
+	ctx := context.Background()
+	root := testutil.NewRepo(t)
+	testutil.WriteFile(t, filepath.Join(root, ".gitignore"), ".env\nnode_modules/\n")
+	testutil.Git(t, root, "add", ".gitignore")
+	testutil.Git(t, root, "commit", "--quiet", "-m", "ignore env")
+	testutil.WriteFile(t, filepath.Join(root, "packages", "api", ".env"), "API_KEY=secret\n")
+	testutil.WriteFile(t, filepath.Join(root, "node_modules", "x", ".env"), "NOPE=1\n")
+	m := newManager(t)
+
+	got, err := m.UnsharedEnvFiles(ctx, root)
+	if err != nil || len(got) != 1 || got[0] != "packages/api/.env" {
+		t.Errorf("unshared = %v, %v", got, err)
+	}
+	// Listed in .worktreeinclude: shared, so nothing to say.
+	testutil.WriteFile(t, filepath.Join(root, ".worktreeinclude"), "**/.env\n")
+	if got, err := m.UnsharedEnvFiles(ctx, root); err != nil || len(got) != 0 {
+		t.Errorf("unshared with .worktreeinclude = %v, %v", got, err)
 	}
 }

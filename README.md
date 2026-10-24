@@ -205,6 +205,13 @@ macOS, an APFS clone: instant, and taking no space until it changes) and
 runs its own branch's setup on top. `skerry reset` goes back to the
 snapshot; `skerry snapshot ls` and `skerry snapshot rm NAME` manage them.
 
+Snapshots and `skerry reset` cover service data only. What commands keep
+in the VM's home directory and `/tmp` (package caches, downloaded
+browsers, build output) lives on a second disk of the workspace's own, so
+it doesn't take the VM's memory; the home directory keeps it across
+restarts, and `/tmp` starts empty. It is never in a snapshot,
+`skerry reset` leaves it, and removing the workspace deletes it.
+
 ## Why not Docker or dev containers?
 
 They solve a different problem: packaging and running services. skerry is
@@ -300,7 +307,8 @@ VM or repository input are fuzzed.
 - Something running in the background in a VM could plant a file between
   scans (up to 15 seconds).
 - No disk quota yet: a VM can fill the disk through its checkout, and its
-  service data disk can grow to 64 GB.
+  service data disk and its home disk (caches) can each grow to 64 GB.
+  Space the VM frees is handed back to your machine.
 - The Temporal dev server and its UI have no authentication. If you forward
   them, any process of any user on your machine can reach them.
 - A web page served from a VM and opened in your browser is a local page: it

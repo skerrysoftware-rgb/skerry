@@ -35,6 +35,9 @@ type Config struct {
 	// DataDisk is a raw disk image attached as the VM's first block
 	// device; empty attaches none.
 	DataDisk string
+	// HomeDisk is a raw disk image attached after DataDisk (or first,
+	// without one); empty attaches none.
+	HomeDisk string
 }
 
 // ErrUnsupported is returned on platforms without a driver.

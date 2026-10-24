@@ -60,6 +60,10 @@ type Config struct {
 	// DataDisk says the VM has a persistent disk for service data. The
 	// agent formats it on first boot if, and only if, it is blank.
 	DataDisk bool `json:"data_disk,omitempty"`
+	// HomeDisk says the VM has a disk for /root and /tmp, after the data
+	// disk if there is one. The agent formats it on first boot if, and
+	// only if, it is blank.
+	HomeDisk bool `json:"home_disk,omitempty"`
 	// Services are preset names the agent runs and supervises.
 	Services []string `json:"services,omitempty"`
 	// Secret is the workspace's password for its services.

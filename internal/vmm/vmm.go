@@ -78,6 +78,9 @@ const (
 	// dataDiskSize is the data disk's capacity. The file is sparse: it
 	// uses only what the guest writes.
 	dataDiskSize = 64 << 30
+	// homeDiskSize is the home disk's capacity, sparse like the data
+	// disk's.
+	homeDiskSize = 64 << 30
 	// servicesTimeout bounds waiting for services at startup; the first
 	// boot initializes their data.
 	servicesTimeout = 3 * time.Minute
@@ -116,7 +119,8 @@ func (m *Manager) progressf(format string, args ...any) {
 // Workspace paths.
 type wsPaths struct {
 	state, share, socket, lock, console, runnerLog, pid, machineID string
-	dataDisk, secret, status, networkLog, image, setup, setupLog   string
+	dataDisk, homeDisk, secret, status, networkLog, image, setup   string
+	setupLog                                                       string
 	stopping, progress, prepare, runtimes, imageSpec               string
 }
 
@@ -136,6 +140,7 @@ func (m *Manager) paths(ws registry.Workspace) (wsPaths, error) {
 		pid:        filepath.Join(state, "runner.pid"),
 		machineID:  filepath.Join(state, "machine-id"),
 		dataDisk:   filepath.Join(state, "data.img"),
+		homeDisk:   filepath.Join(state, "home.img"),
 		secret:     filepath.Join(state, "secret"),
 		status:     filepath.Join(state, "status.json"),
 		networkLog: filepath.Join(state, "network.log"),
@@ -425,6 +430,17 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 		}
 		cfg.Services, cfg.DataDisk, dataDisk = proj.Services, true, p.dataDisk
 	}
+	// The home disk holds what commands keep under the home directory and
+	// in /tmp: package managers' caches, downloaded browsers, build
+	// output. Without it they would fill the root filesystem, which is in
+	// memory. It is the workspace's own: not in snapshots, kept by reset,
+	// deleted with the workspace.
+	homeDisk := p.homeDisk
+	if err := ensureSparse(homeDisk, homeDiskSize); err != nil {
+		fmt.Fprintf(os.Stderr, "home disk: %v; caches stay in memory\n", err)
+		homeDisk = ""
+	}
+	cfg.HomeDisk = homeDisk != ""
 	if err := agent.WriteConfig(p.share, cfg); err != nil {
 		return err
 	}
@@ -459,7 +475,7 @@ func (m *Manager) Run(ctx context.Context, ws registry.Workspace) error {
 		Kernel: img.Kernel, Initramfs: img.Initramfs, Rootfs: img.Rootfs,
 		ConfigDir: p.share, WorkDir: ws.Path, CPUs: cpus, MemoryMiB: memMiB,
 		MachineIDFile: p.machineID, Console: console,
-		Network: vmNet, MAC: macFor(ws.ID), DataDisk: dataDisk,
+		Network: vmNet, MAC: macFor(ws.ID), DataDisk: dataDisk, HomeDisk: homeDisk,
 	})
 	if err != nil {
 		vmNet.Close()

@@ -181,7 +181,10 @@ then.
 
 Every image has git, curl, and a C and C++ toolchain (gcc, make,
 pkg-config) with each runtime's headers (and libpq's, with Postgres), so
-dependencies that compile native code install. Extra packages from the same signed repository the image is built from
+dependencies that compile native code install. The VM's home directory
+and `/tmp` are on a disk of the workspace's own, so package caches and
+downloads (npm's cache, a test runner's browsers) don't take its memory;
+the home directory keeps them across restarts, and `/tmp` starts empty. Extra packages from the same signed repository the image is built from
 (Wolfi), by name: `ffmpeg`, `imagemagick`, `postgresql-17-contrib`… Up to
 32, and an image's packages may add up to 3 GB at most. Their install
 scripts run in a build VM, never on your machine.

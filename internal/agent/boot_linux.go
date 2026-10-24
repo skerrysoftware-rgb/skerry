@@ -186,9 +186,16 @@ func PID1() error {
 			logger.Printf("network: %v", err)
 		}
 	}
+	disks := diskDevices
 	if cfg.DataDisk {
-		if err := mountDataDisk(); err != nil {
+		if err := mountDisk(disks[0], dataMount, "skerry-data", false); err != nil {
 			logger.Printf("data disk: %v", err)
+		}
+		disks = disks[1:]
+	}
+	if cfg.HomeDisk && cfg.Mode == ModeServe {
+		if err := mountHome(disks[0]); err != nil {
+			logger.Printf("home disk: %v (caches stay in memory)", err)
 		}
 	}
 	if cfg.Mode == ModeFinalize {

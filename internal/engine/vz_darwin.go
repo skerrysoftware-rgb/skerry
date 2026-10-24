@@ -107,18 +107,33 @@ func Start(cfg Config) (*VM, error) {
 		}
 		vcfg.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nic})
 	}
-	if cfg.DataDisk != "" {
+	// Disks in order: the guest finds them as /dev/vda, /dev/vdb.
+	var disks []vz.StorageDeviceConfiguration
+	for _, d := range []struct {
+		name, path string
+		sync       vz.DiskImageSynchronizationMode
+	}{
 		// Fsync keeps what the guest flushed safe across a host crash.
-		attach, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(cfg.DataDisk, false,
-			vz.DiskImageCachingModeAutomatic, vz.DiskImageSynchronizationModeFsync)
+		{"data disk", cfg.DataDisk, vz.DiskImageSynchronizationModeFsync},
+		// Caches: losing the last writes in a crash costs a download.
+		{"home disk", cfg.HomeDisk, vz.DiskImageSynchronizationModeNone},
+	} {
+		if d.path == "" {
+			continue
+		}
+		attach, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(d.path, false,
+			vz.DiskImageCachingModeAutomatic, d.sync)
 		if err != nil {
-			return nil, fmt.Errorf("data disk: %w", err)
+			return nil, fmt.Errorf("%s: %w", d.name, err)
 		}
 		disk, err := vz.NewVirtioBlockDeviceConfiguration(attach)
 		if err != nil {
 			return nil, err
 		}
-		vcfg.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{disk})
+		disks = append(disks, disk)
+	}
+	if len(disks) > 0 {
+		vcfg.SetStorageDevicesVirtualMachineConfiguration(disks)
 	}
 
 	if ok, err := vcfg.Validate(); !ok || err != nil {

@@ -172,7 +172,7 @@ The driver interface: `Create`, `Start`, `Stop`, `Save`, `Restore`, `Destroy`,
 | Postgres data, Redis data | Per-workspace data disk (sparse raw file, ext4 created by the guest on first boot) | Survives VM stops; fast; clonable |
 | Linux `node_modules` | On the data disk, bind-mounted over each `node_modules` path inside `/work` | Native modules differ between macOS and Linux; keeps host `node_modules` for the editor |
 | Host `node_modules` | APFS clone (`clonefile`) of the main checkout's | Instant; your editor's TypeScript server and ESLint keep working |
-| Package caches | Per-repository cache share | Same trust domain as the repo; yarn verifies checksums from the lockfile |
+| Package caches, `/tmp` | Per-workspace home disk (sparse raw file, ext4) mounted over `/root` and `/tmp` | Off the in-memory root; never in snapshots, kept by reset, deleted with the workspace |
 
 Copy-on-write cloning: `clonefile` on APFS. On Linux, reflink on btrfs and
 XFS. On ext4, a qcow2 overlay on a read-only base disk (Cloud Hypervisor,

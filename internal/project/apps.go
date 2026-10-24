@@ -241,7 +241,7 @@ func envFilesExample(root *os.Root, dir string) (map[string]string, []string, bo
 		if err != nil {
 			continue
 		}
-		vars := ParseEnv(data)
+		vars := envShape(ParseEnv(data))
 		if name == ".env.example" {
 			example = true
 			// Only for ports, and only what real files don't say.
@@ -286,6 +286,34 @@ func expectedKeys(root *os.Root, dirs ...string) []string {
 func keysOf(env map[string]string) []string {
 	out := slices.Collect(maps.Keys(env))
 	sort.Strings(out)
+	return out
+}
+
+// envShape keeps of an env file only what detection uses: every
+// variable's name, and the values that are local addresses or port
+// numbers, with any password in a URL removed. Every other value (API
+// keys, tokens, remote URLs) is dropped as soon as the file is read: skerry
+// never holds, prints or sends them.
+func envShape(vars map[string]string) map[string]string {
+	out := make(map[string]string, len(vars))
+	for k, v := range vars {
+		out[k] = ""
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
+			out[k] = v
+			continue
+		}
+		if hostPort.MatchString(v) {
+			out[k] = v
+			continue
+		}
+		if u, err := url.Parse(v); err == nil && u.Scheme != "" && slices.Contains(localHosts, u.Hostname()) {
+			if u.User != nil {
+				u.User = url.User(u.User.Username())
+			}
+			u.RawQuery, u.Fragment = "", ""
+			out[k] = u.String()
+		}
+	}
 	return out
 }
 
@@ -339,7 +367,7 @@ func appFor(root *os.Root, dir string, pkg packageJSON, pm string) (App, bool) {
 	for _, f := range dotenvFiles(script, dir) {
 		if data, err := readRootFile(root, f, maxEnvFile); err == nil {
 			files = append(files, filepath.ToSlash(f))
-			maps.Copy(env, ParseEnv(data))
+			maps.Copy(env, envShape(ParseEnv(data)))
 		}
 	}
 	own, ownFiles, example := envFilesExample(root, dir)

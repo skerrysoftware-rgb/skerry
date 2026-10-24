@@ -173,13 +173,12 @@ already has:
 
 It also installs dependencies from the lockfile (`npm ci`,
 `pnpm install --frozen-lockfile`, `uv sync --frozen`, …), reads every
-package of a monorepo, creates the local databases the project's env files
-point to, and builds what the apps import. Env files are read on your
-machine for their shape only (local addresses, ports, variable names):
-skerry never stores, prints, sends or copies their values. A workspace
-gets your `.env` files only if the repository's `.worktreeinclude` lists
-them (`**/.env` covers every folder's); `skerry plan` tells you which
-ones your workspaces are missing.
+package of a monorepo, gives each new workspace copies of your checkout's
+local `.env` files (so apps run as they do in your checkout), creates the
+local databases they point to, and builds what the apps import. skerry
+itself reads env files only for local addresses, ports and variable
+names: every other value, and any password in a URL, is dropped as the
+file is read, and nothing from them is stored, printed or sent anywhere.
 It also finds the project's apps (packages with a `dev` script and a
 port, Procfile processes, Django's and Rails' dev servers), which
 `skerry start` runs, with their ports forwarded to your machine; they
@@ -340,11 +339,10 @@ VM or repository input are fuzzed.
 - Setup commands from `skerry.yaml`, dependency installs and builds run
   in the VM without asking, as `npm install` would; the project's apps run
   when you (or Claude) run `skerry start`.
-- Files a repository's `.worktreeinclude` lists (a `.env`, say) are
-  copied into each new workspace, as Claude Code copies them, so code in
-  the VM can read them, and the VM can reach the internet. Without one,
-  a workspace gets no env files, and an app that needs one won't start
-  until you add it.
+- Your local `.env` files (secrets included) are copied into each new
+  workspace, as Claude Code's `.worktreeinclude` copies what it lists, so
+  code in the VM can read them, and the VM can reach the internet. Add a
+  `.worktreeinclude` to choose exactly which files a workspace gets.
 - A VM can reach anything public, from your machine's public address: code
   in it can send what it can read (the checkout) to the internet, and reach
   services that trust your IP address or a public range routed over your
@@ -416,7 +414,7 @@ Settings, through environment variables for now:
 | ✅ Dependencies installed from the lockfile; setup re-run when a merge changes them | |
 | ✅ Monorepos: services, apps and library watchers detected across packages; `skerry start` runs apps with forwarded ports | |
 | ✅ Procfiles, Django and Rails dev servers; Python, Ruby and Go runtimes detected | |
-| ✅ Local databases the project's env files name, created; env file values never read for anything else | |
+| ✅ Local `.env` files copied into workspaces; the databases they name created; their secrets never read | |
 | ✅ Seeds, setup commands (migrations), snapshots cloned per workspace | |
 | ✅ Hot reload; idle stop; CPU and memory limits | |
 | ✅ Images built only from signature-verified packages | |

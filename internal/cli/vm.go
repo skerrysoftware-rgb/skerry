@@ -947,9 +947,8 @@ func joinPorts(ports []uint16) string {
 }
 
 // printEnvHint says which of the main checkout's env files workspaces
-// don't get, and how to share them: skerry never copies env files, so an
-// app that needs one won't start until the repository's .worktreeinclude
-// lists it. Paths only; contents are never read.
+// don't get because the repository's .worktreeinclude leaves them out,
+// and how to share them. Paths only; contents are never read.
 func printEnvHint(ctx context.Context, m *workspace.Manager, w io.Writer, repo string) {
 	files, err := m.UnsharedEnvFiles(ctx, repo)
 	if err != nil || len(files) == 0 {
@@ -963,10 +962,9 @@ func printEnvHint(ctx context.Context, m *workspace.Manager, w io.Writer, repo s
 	if len(files) > len(shown) {
 		more = fmt.Sprintf(" and %d more", len(files)-len(shown))
 	}
-	fmt.Fprintf(w, "env files: workspaces don't get %s%s from your checkout.\n", termsafe.Clean(strings.Join(shown, ", ")), more)
-	fmt.Fprintln(w, "  skerry never copies env files, which often hold secrets. If the apps need them, list them in")
-	fmt.Fprintln(w, "  .worktreeinclude at the repository root (patterns like .gitignore; **/.env covers every folder's);")
-	fmt.Fprintln(w, "  new workspaces then get copies, which code in their VM can read.")
+	fmt.Fprintf(w, "env files: workspaces don't get %s%s from your checkout,\n", termsafe.Clean(strings.Join(shown, ", ")), more)
+	fmt.Fprintln(w, "  because the repository's .worktreeinclude doesn't list them. If the apps need them, add them")
+	fmt.Fprintln(w, "  there (patterns like .gitignore; **/.env covers every folder's).")
 }
 
 // appPorts describes where an app listens.

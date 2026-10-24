@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -163,8 +164,8 @@ var envFilePatterns = []string{
 
 // LocalEnvFiles lists, by path, the env files (.env, .env.local,
 // .env.development, .env.development.local, in any folder outside
-// node_modules) that git ignores in the checkout at root. Their contents
-// are never read.
+// node_modules) that git ignores in the checkout at root: the ones a
+// developer keeps locally. Their contents aren't read here.
 func (g Git) LocalEnvFiles(ctx context.Context, root string) ([]string, error) {
 	guard, err := g.guard(ctx, root, false)
 	if err != nil {
@@ -177,7 +178,14 @@ func (g Git) LocalEnvFiles(ctx context.Context, root string) ([]string, error) {
 	}
 	var files []string
 	for _, f := range strings.Split(out, "\x00") {
-		if f != "" && !strings.Contains("/"+f, "/node_modules/") && len(files) < 200 {
+		// Only the files themselves: git also names nested checkouts (other
+		// worktrees) as folders here.
+		switch path.Base(f) {
+		case ".env", ".env.local", ".env.development", ".env.development.local":
+		default:
+			continue
+		}
+		if !strings.HasSuffix(f, "/") && !strings.Contains("/"+f, "/node_modules/") && len(files) < 200 {
 			files = append(files, f)
 		}
 	}

@@ -1,6 +1,7 @@
 package project
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -411,5 +412,22 @@ func TestComposeDatabases(t *testing.T) {
 		if !slices.Contains(p.Databases, w) {
 			t.Errorf("databases = %v, want %v", p.Databases, w)
 		}
+	}
+}
+
+func TestEnvShapeDropsSecrets(t *testing.T) {
+	got := envShape(map[string]string{
+		"PORT":         "5183",
+		"DATABASE_URL": "postgres://shop:hunter2@localhost:5432/shop?sslmode=disable",
+		"API_URL":      "localhost:4000",
+		"STRIPE_KEY":   "sk_live_abc",
+		"REMOTE_DB":    "postgres://u:pw@db.example.com/x",
+	})
+	want := map[string]string{
+		"PORT": "5183", "DATABASE_URL": "postgres://shop@localhost:5432/shop", "API_URL": "localhost:4000",
+		"STRIPE_KEY": "", "REMOTE_DB": "",
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("envShape = %v, want %v", got, want)
 	}
 }

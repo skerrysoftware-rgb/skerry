@@ -202,17 +202,16 @@ func (h *Handler) sessionStart(in Input) error {
 	})
 }
 
-// envContext says, when the main checkout has env files this workspace
-// didn't get, how they are shared. Only a count: file names come from the
-// checkout, and their contents are never read.
+// envContext says, when the repository's .worktreeinclude leaves out env
+// files this workspace may need, how they are shared. Only a count: file
+// names come from the checkout, and their contents are never read.
 func (h *Handler) envContext(ws registry.Workspace) string {
 	files, err := h.Manager.UnsharedEnvFiles(context.Background(), ws.Repo)
 	if err != nil || len(files) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" The main checkout has %d env file(s) this workspace didn't get: skerry never copies env files, which often hold secrets."+
-		" If the project's apps need them, tell the user; they share them by listing them in .worktreeinclude at the repository root"+
-		" (new workspaces then get copies, which code in the VM can read). Don't copy them yourself. `skerry plan` lists them.", len(files))
+	return fmt.Sprintf(" The main checkout has %d env file(s) this workspace didn't get, because the repository's .worktreeinclude doesn't list them."+
+		" If the project's apps need them, tell the user, who can add them there; don't copy them yourself. `skerry plan` lists them.", len(files))
 }
 
 // vmCommands lists, in backquotes, the commands that run in the VM for

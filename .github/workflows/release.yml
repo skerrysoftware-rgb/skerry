@@ -1,0 +1,68 @@
+# Builds skerry for macOS on Apple silicon when a version tag (v0.1.0) is
+# pushed, and publishes it as a release: the binary, its checksums, and a
+# build provenance attestation, so anyone can check that a download was
+# built here, from this repository, by this workflow:
+#
+#   gh attestation verify skerry-darwin-arm64.tar.gz --repo skerrysoftware-rgb/skerry
+#
+# Actions are pinned to commits, and the job gets only the permissions it
+# needs.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: macos-latest # Apple silicon
+    permissions:
+      contents: write     # create the release
+      id-token: write     # sign the attestation
+      attestations: write # store it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # nothing restored from earlier runs goes into a release
+
+      - name: Check
+        run: |
+          make lint
+          go test ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          make build VERSION="$VERSION"
+          # Signed (ad hoc) with the entitlement that lets it start VMs.
+          codesign --display --entitlements - bin/skerry 2>/dev/null | grep -q com.apple.security.virtualization
+          file bin/skerry | grep -q arm64
+          ./bin/skerry version
+
+      - name: Package
+        run: |
+          tar -C bin -czf skerry-darwin-arm64.tar.gz skerry
+          shasum -a 256 skerry-darwin-arm64.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: skerry-darwin-arm64.tar.gz
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" skerry-darwin-arm64.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "skerry $TAG" \
+            --notes "macOS on Apple silicon. Install and verify: see the README's Get started section."

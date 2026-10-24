@@ -35,14 +35,36 @@ with a new migration, has a `gift_note` column.*
 
 ## Get started with Claude Code
 
-**1. Install skerry.** For now, build it from source on a Mac with Apple
-Silicon (Go 1.27+):
+**1. Install skerry** on a Mac with Apple Silicon:
+
+```bash
+curl -fsSLO https://github.com/skerrysoftware-rgb/skerry/releases/latest/download/skerry-darwin-arm64.tar.gz
+mkdir -p ~/.local/bin && tar -xzf skerry-darwin-arm64.tar.gz -C ~/.local/bin   # or anywhere on your PATH
+```
+
+Each release is built by [GitHub Actions](.github/workflows/release.yml)
+from this repository, with checksums (`SHA256SUMS`) and a signed build
+provenance attestation. To check a download was built here, before
+installing it:
+
+```bash
+gh attestation verify skerry-darwin-arm64.tar.gz --repo skerrysoftware-rgb/skerry
+```
+
+Downloaded it with a browser instead? macOS then won't run it ("cannot be
+opened"), as it isn't notarized yet; clear the download flag with
+`xattr -d com.apple.quarantine ~/.local/bin/skerry`.
+
+<details>
+<summary>Or build it from source (Go 1.27+)</summary>
 
 ```bash
 git clone https://github.com/skerrysoftware-rgb/skerry && cd skerry
 make build                      # bin/skerry, signed to run VMs
 cp bin/skerry ~/.local/bin/     # or anywhere on your PATH
 ```
+
+</details>
 
 **2. Connect it to Claude Code.**
 

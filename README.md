@@ -11,9 +11,11 @@ runs has your whole machine within reach.
 
 skerry gives each worktree its own small Linux VM, with its own processes,
 ports, Postgres, Valkey (Redis) and Temporal, and its own copy of their data.
-It plugs into Claude Code, so every worktree session gets one automatically,
-and the VM is ready in the background while the session gets on with the
-work.
+It reads what it needs from the repository (lockfiles, `.env` files, compose
+files, monorepo packages), so most projects need no configuration. It plugs
+into Claude Code, so every worktree session gets one automatically and the
+VM is ready in the background while the session gets on with the work; with
+any other tool, `skerry create` makes a workspace by hand.
 
 ![Two live Claude Code sessions side by side, each in its own skerry workspace. As they start, the status line shows skerry preparing each workspace in the background (starting the VM, setting up) while Claude reads and edits code. One adds a feature and places an order; the other merges a branch that brings a new migration and places an order with a gift note. Each has its own Postgres and Temporal, so both get order #1.](docs/demo/demo.gif)
 
@@ -52,23 +54,25 @@ This shows the three hooks it will add to `~/.claude/settings.json`
 asks which folders to turn skerry on for. skerry only ever acts in those
 folders; everywhere else, worktrees stay plain worktrees.
 
-Prefer Claude Code plugins? Install skerry's plugin instead: it carries the
-same three hooks (and a small script that finds the `skerry` command), and
-nothing else. In any Claude Code session, from any folder, run:
+<details>
+<summary>Or use the Claude Code plugin instead</summary>
+
+The plugin carries the same three hooks (and a small script that finds the
+`skerry` command), and nothing else. In any Claude Code session, from any
+folder:
 
 ```text
 /plugin marketplace add skerrysoftware-rgb/skerry
 /plugin install skerry@skerry
 ```
 
-The first command adds this GitHub repository
-(github.com/skerrysoftware-rgb/skerry) as a plugin marketplace: Claude Code
-downloads the plugin from it, using your git access to GitHub. The second
-installs the plugin for your user, in every project. The plugin doesn't
-include skerry itself, which must already be installed and on your `PATH`
-(step 1), and skerry still only acts in the folders you enable
-(`skerry enable DIR`). Use the plugin or `skerry claude install`, not both:
-two `WorktreeCreate` hooks would both try to make the worktree.
+The first command adds this GitHub repository as a plugin marketplace; the
+second installs the plugin for your user, in every project. skerry itself
+must still be installed (step 1), and it still only acts in the folders you
+enable (`skerry enable DIR`). Use the plugin or `skerry claude install`, not
+both: two `WorktreeCreate` hooks would both try to make the worktree.
+
+</details>
 
 **3. Start sessions in worktrees, as you already do.**
 
@@ -84,6 +88,19 @@ you can see it being prepared (add to `~/.claude/settings.json`):
 
 ```json
 "statusLine": { "type": "command", "command": "skerry statusline" }
+```
+
+**Without Claude Code** (or with another agent), make a workspace yourself
+and work in it:
+
+```bash
+skerry enable ~/code              # once: skerry acts only in folders you enable
+cd ~/code/shop
+skerry plan                       # what skerry found, before anything runs
+cd "$(skerry create fix-login)"   # a worktree that gets its own VM
+skerry exec -- npm test           # the first command boots and prepares it, then runs
+skerry start                      # run the project's apps, forwarded to your machine
+skerry status                     # services, apps, and where each is on your machine
 ```
 
 ## What happens in a session
@@ -118,6 +135,29 @@ you can see it being prepared (add to `~/.claude/settings.json`):
    other.
 6. **Removing the worktree removes the workspace**: its VM and its data.
    Uncommitted work and branches with commits are never deleted.
+
+## How it works
+
+- **One VM per workspace**, on Apple's Virtualization framework: a small
+  Linux kernel (Alpine's) and a userland built from signature-verified
+  [Wolfi](https://wolfi.dev) packages, shared read-only by every workspace
+  that needs the same runtimes and services. It boots in about half a
+  second.
+- **Your checkout, live.** The worktree is shared into the VM at the same
+  path (virtio-fs), so your editor, git and the VM all see the same files.
+  Dependencies install into it as Linux builds.
+- **Its own disks.** Service data (Postgres, Valkey) and caches (the home
+  directory, `/tmp`) live on sparse disk images of the workspace's own;
+  the rest of the system is in memory.
+- **A guest agent**, the VM's first process, runs the services and apps
+  and takes commands from skerry over SSH on vsock, with keys pinned per
+  workspace.
+- **A user-mode network.** The VM's network card connects to a network
+  stack inside skerry ([gVisor's](https://gvisor.dev)), which lets it reach
+  the internet and nothing local. Ports are forwarded to your machine's
+  `127.0.0.1`.
+- **Sized to the project**: 4 CPUs and 3 GB by default, more memory for
+  each service and app, within half your machine.
 
 ## Configure a project
 
@@ -212,11 +252,12 @@ it doesn't take the VM's memory; the home directory keeps it across
 restarts, and `/tmp` starts empty. It is never in a snapshot,
 `skerry reset` leaves it, and removing the workspace deletes it.
 
-## Why not Docker or dev containers?
+## Why not Docker, dev containers, or one Linux VM?
 
-They solve a different problem: packaging and running services. skerry is
-about giving many parallel coding sessions, and the code agents run, their
-own isolated machines, with no setup per session.
+They solve a different problem: packaging and running services, or giving
+you one Linux machine (OrbStack, Lima, a dev VM). skerry is about giving
+many parallel coding sessions, and the code agents run, their own isolated
+machines, set up from the repository, with no setup per session.
 
 - **Its own kernel per workspace.** Containers share a kernel: on Linux,
   your machine's; on macOS, one Docker Desktop VM shared by every container.
@@ -268,16 +309,18 @@ it. Found a way out? Please report it privately, as
   (`skerry logs network`).
 - **Services reachable only from your machine.** Forwarded ports listen on
   `127.0.0.1` only, at ports skerry picks (never ones the checkout names,
-  which could take over ports your own servers use). The apps' web ports
-  answer only to `localhost` names, so a web page can't reach them by DNS
-  rebinding. From your machine, Postgres and Valkey each require
-  their own password, which other local users can't read (inside the VM,
-  where everything runs as root anyway, Postgres trusts the user a
-  command names, so a project's `.env` URLs work unchanged, including on
-  the other ports they may use, which relay to the service inside the VM
-  only); services without a password aren't
-  forwarded unless you ask. Output from the VM that skerry prints itself
-  (logs, errors) is stripped of terminal control sequences.
+  which could take over ports your own servers use). From your machine,
+  Postgres and Valkey each require their own password, which other local
+  users can't read; services without a password aren't forwarded unless
+  you ask. The apps' web ports answer only to `localhost` names, so a web
+  page can't reach them by DNS rebinding.
+- **Trust inside the VM only.** Inside the VM, where everything runs as
+  root anyway, Postgres trusts the user a command names, so a project's
+  `.env` URLs work unchanged (on other ports too, which relay to the
+  service inside the VM). Connections forwarded from your machine never
+  get that trust.
+- **Clean output.** What skerry prints from the VM (logs, errors) is
+  stripped of terminal control sequences.
 - **Locked git metadata.** The worktree's `.git` pointer is made immutable,
   and skerry's own git commands name the repository explicitly, so a VM
   can't redirect them. After every command, at session start and every
@@ -336,29 +379,37 @@ VM or repository input are fuzzed.
 The full threat model, and the rules every change is tested against, are in
 [docs/design.md](docs/design.md#7-security).
 
-## Command reference
+## Commands
 
-You rarely need these with Claude Code; they are for working with workspaces
-by hand.
+You rarely need these with Claude Code; these are the ones for working by
+hand:
+
+| Command | What it does |
+|---|---|
+| `skerry plan [--env] [DIR]` | Show what skerry would set up for a checkout, and how its apps are wired, without starting anything |
+| `skerry create NAME [--base BRANCH]` | Make a workspace (worktree on branch `worktree-NAME`) and print its path |
+| `skerry start [APP…]` / `stop [APP…]` | Run or stop the project's apps in the VM (all, or the ones named); they never start on their own |
+| `skerry status [NAME]` | Preparation, services, setup, whether each app answers, and where everything is on your machine |
+| `skerry exec -- CMD…` | Run a command in the workspace's VM |
+| `skerry logs [-f] WHAT` | A service's or an app's output, or `setup`, `console`, `network` |
+| `skerry rm NAME [--force]` | Remove a workspace; `--force` discards uncommitted changes but never a branch with commits |
+
+Commands that act on a workspace use the one you're in, unless you name one.
+
+<details>
+<summary>All commands and settings</summary>
 
 | Command | What it does |
 |---|---|
 | `skerry claude install` / `uninstall` | Add or remove the Claude Code hooks |
 | `skerry enable [DIR]` / `disable [DIR]`, `enable --list` | Turn skerry on or off for a folder and everything under it |
-| `skerry create NAME [--base BRANCH]` | Make a workspace (worktree on branch `worktree-NAME`) and print its path |
 | `skerry ls` | List workspaces |
-| `skerry status [NAME]` | Show a workspace: preparation, services, setup, whether each app answers, forwarded ports |
-| `skerry plan [--env] [DIR]` | Show what skerry would set up for a checkout, and how its apps are wired, without starting anything |
 | `skerry up [NAME]` / `down [NAME]` | Start (and prepare) or stop a workspace's VM |
-| `skerry start [-w NAME] [APP…]` / `stop [-w NAME] [APP…]` | Run or stop the project's apps in the VM (all, or the ones named); they never start on their own |
-| `skerry exec [-w NAME] -- CMD…` | Run a command in the workspace's VM |
-| `skerry url [-w NAME] SERVICE` | Print a URL for a service, for tools on your machine |
-| `skerry logs [-w NAME] [-f] WHAT` | A service's or an app's log, or `setup`, `console`, `network` |
+| `skerry url [-w NAME] SERVICE` | Print a URL for a service, password included, for tools on your machine |
 | `skerry setup [NAME]` | Run the project's seed and setup again |
 | `skerry seed [-w NAME] FILE` | Load a `.sql`, `.sql.gz` or `.dump` file into the workspace's empty Postgres |
 | `skerry snapshot save [S]` / `ls` / `rm S` | Save the workspace's data for new workspaces (`default`); list or delete snapshots |
 | `skerry reset [NAME] [--snapshot S \| --empty]` | Start the workspace's data over |
-| `skerry rm NAME [--force]` | Remove a workspace; `--force` discards uncommitted changes but never a branch with commits |
 | `skerry gc` | Delete images and downloads no workspace needs |
 | `skerry statusline` | One line for Claude Code's status line |
 
@@ -366,18 +417,16 @@ Settings, through environment variables for now:
 
 | Variable | Effect |
 |---|---|
-| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused (no commands, no connections to its ports) this long (default `30m`; `off` never), apps included. The next command starts it again; `skerry start` starts the apps again |
-| `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`; at most all CPUs and half the machine's memory) |
+| `SKERRY_IDLE_STOP` | Stop a workspace's VM after it has been unused (no commands, no connections to its ports) this long (default `30m`; `off` never), apps included. Its data stays; the next command starts it again, and `skerry start` the apps |
+| `SKERRY_CPUS`, `SKERRY_MEMORY` | CPUs and memory per VM (default 4 and `3g`, more memory for each service and app; at most all CPUs and half the machine's memory) |
 | `SKERRY_BASE=head` | Start new worktrees at your current commit instead of the remote's default branch |
 | `SKERRY_GIT_HOOKS=1` | Let the repository's git hooks run when creating worktrees (off by default) |
 | `SKERRY_BRANCH_PREFIX` | Prefix for new branches (default `worktree-`) |
-| `SKERRY_FILE_EVENTS=off` | Don't forward file changes to watchers in the VM |
+| `SKERRY_FILE_EVENTS=off` | Don't forward file changes to watchers in the VM (by default, watchers in a VM see edits made on your machine) |
 | `SKERRY_SHIMS=off` | Run your machine's own `node`, `python`… even in workspaces |
 | `SKERRY_HOME` | Keep all of skerry's state and caches under one directory |
 
-A workspace that nothing has used for 30 minutes stops its VM; its data
-stays, and the next command starts it again. Watchers in a VM see edits made
-on your machine: skerry raises a file event in the VM for each changed file.
+</details>
 
 ## What works today
 
@@ -409,6 +458,13 @@ on your machine: skerry raises a file event in the VM for each changed file.
 signs `bin/skerry` with the `com.apple.security.virtualization` entitlement
 so it can start VMs. A plain `go build` produces a binary without the agent
 or the signature.
+
+## Feedback
+
+skerry is early. If it gets something wrong on your project (a service it
+missed, an app it didn't find, setup that failed), `skerry plan` output in
+an [issue](https://github.com/skerrysoftware-rgb/skerry/issues) helps most.
+Security problems go to [SECURITY.md](SECURITY.md) instead.
 
 ## License
 
